@@ -522,7 +522,7 @@ func (m *mockRepository) UpdateTaskSession(ctx context.Context, session *models.
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.updateTaskSessionCalls = append(m.updateTaskSessionCalls, session)
-	m.sessions[session.ID] = session
+	m.sessions[session.ID] = cloneMockTaskSession(session)
 	return nil
 }
 
@@ -547,7 +547,7 @@ func (m *mockRepository) UpdateTaskSessionIfCurrentState(
 	}
 	m.updateTaskSessionSnapshots = append(m.updateTaskSessionSnapshots, cloneMockTaskSession(session))
 	m.updateTaskSessionCalls = append(m.updateTaskSessionCalls, session)
-	m.sessions[session.ID] = session
+	m.sessions[session.ID] = cloneMockTaskSession(session)
 	return true, nil
 }
 
@@ -965,6 +965,9 @@ func (m *mockRepository) GetWorkspace(ctx context.Context, id string) (*models.W
 func (m *mockRepository) CreateWorkspace(ctx context.Context, workspace *models.Workspace) error {
 	return nil
 }
+func (m *mockRepository) UpdateWorkspaceFields(_ context.Context, _ string, _ models.WorkspaceFieldUpdate, _ *time.Time) (*models.Workspace, error) {
+	return nil, nil
+}
 func (m *mockRepository) UpdateWorkspace(ctx context.Context, workspace *models.Workspace) error {
 	return nil
 }
@@ -997,6 +1000,10 @@ func (m *mockRepository) GetTasksByIDs(ctx context.Context, ids []string) ([]*mo
 	return out, nil
 }
 func (m *mockRepository) UpdateTask(ctx context.Context, task *models.Task) error { return nil }
+
+func (m *mockRepository) UpdateTaskFieldsWithParentAdmission(context.Context, string, models.TaskFieldUpdate, repository.TaskParentValidator) (*models.TaskFieldUpdateResult, error) {
+	return nil, fmt.Errorf("field updates are not supported by this test repository")
+}
 func (m *mockRepository) UpdateTaskWithExplicitPosition(ctx context.Context, task *models.Task) error {
 	return nil
 }
@@ -1021,6 +1028,10 @@ func (m *mockRepository) RemoveTaskFromWorkflow(ctx context.Context, taskID, wor
 }
 
 // TaskRepository operations
+func (m *mockRepository) ReplaceTaskRepositories(context.Context, string, func(models.TaskRepositoryReplacementSnapshot) ([]*models.TaskRepository, error)) ([]*models.TaskRepository, error) {
+	return nil, fmt.Errorf("complete repository replacement is unsupported by this executor fixture")
+}
+
 func (m *mockRepository) CreateTaskRepository(ctx context.Context, taskRepo *models.TaskRepository) error {
 	return nil
 }

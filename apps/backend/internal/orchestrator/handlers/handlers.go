@@ -11,8 +11,10 @@ import (
 	"github.com/kandev/kandev/internal/orchestrator"
 	"github.com/kandev/kandev/internal/orchestrator/dto"
 	"github.com/kandev/kandev/internal/orchestrator/executor"
+	taskdto "github.com/kandev/kandev/internal/task/dto"
 	"github.com/kandev/kandev/internal/task/models"
 	taskrepo "github.com/kandev/kandev/internal/task/repository/sqlite"
+	"github.com/kandev/kandev/internal/worktree"
 	ws "github.com/kandev/kandev/pkg/websocket"
 	"go.uber.org/zap"
 )
@@ -43,6 +45,7 @@ func (h *Handlers) RegisterHandlers(d *ws.Dispatcher) {
 	d.RegisterFunc(ws.ActionSessionFork, h.wsForkConversation)
 	d.RegisterFunc(ws.ActionSessionEnsure, h.wsEnsureSession)
 	d.RegisterFunc(ws.ActionSessionRecover, h.wsRecoverSession)
+	d.RegisterFunc(ws.ActionSessionWorkspaceRecoveryGet, h.wsGetWorkspaceRecoveryStatus)
 	d.RegisterFunc(ws.ActionTaskLaunchRecover, h.wsRecoverTaskLaunch)
 	d.RegisterFunc(ws.ActionSessionResetContext, h.wsResetContext)
 	d.RegisterFunc(ws.ActionSessionStop, h.wsStopSession)
@@ -141,6 +144,12 @@ func (h *Handlers) wsLaunchSession(ctx context.Context, msg *ws.Message) (*ws.Me
 
 	resp, err := h.service.LaunchSession(ctx, &req)
 	if err != nil {
+		if recoveryResponse, responseErr := managedCloneRelocationConflictResponse(msg, err); recoveryResponse != nil || responseErr != nil {
+			return recoveryResponse, responseErr
+		}
+		if recoveryResponse, responseErr := recoveryInspectionConflictResponse(msg, err); recoveryResponse != nil || responseErr != nil {
+			return recoveryResponse, responseErr
+		}
 		if guardResponse, responseErr := sessionRecoveryGuardConflictResponse(msg, err); guardResponse != nil || responseErr != nil {
 			return guardResponse, responseErr
 		}
@@ -305,12 +314,49 @@ type wsRecoverSessionRequest struct {
 	SettingsPolicy executor.ResumeSettingsPolicy `json:"settings_policy,omitempty"`
 }
 
+type wsGetWorkspaceRecoveryStatusRequest struct {
+	TaskID    string `json:"task_id"`
+	SessionID string `json:"session_id"`
+}
+
+func (h *Handlers) wsGetWorkspaceRecoveryStatus(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req wsGetWorkspaceRecoveryStatusRequest
+	if err := msg.ParsePayload(&req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.TaskID == "" || req.SessionID == "" {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id and session_id are required", nil)
+	}
+	operation, runnerLive, err := h.service.GetWorkspaceRecoveryStatus(ctx, req.TaskID, req.SessionID)
+	if err != nil {
+		h.logger.Warn("failed to read workspace recovery status",
+			zap.String("task_id", req.TaskID), zap.String("session_id", req.SessionID), zap.Error(err))
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to read workspace recovery status", nil)
+	}
+	return ws.NewResponse(msg.ID, msg.Action, map[string]any{
+		"workspace_recovery": taskdto.WorkspaceRecoveryFromOperation(operation, runnerLive),
+	})
+}
+
 func managedCloneRelocationConflictResponse(msg *ws.Message, err error) (*ws.Message, error) {
 	var recoveryErr *orchestrator.ManagedCloneRelocationRecoveryError
 	if !errors.As(err, &recoveryErr) {
 		return nil, nil
 	}
 	return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeConflict, err.Error(), recoveryErr.Details())
+}
+
+func recoveryInspectionConflictResponse(msg *ws.Message, err error) (*ws.Message, error) {
+	if !worktree.IsRecoveryInspectionContentionOnly(err) {
+		return nil, nil
+	}
+	var contention *worktree.RecoveryInspectionContentionError
+	if !errors.As(err, &contention) {
+		return nil, nil
+	}
+	return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeConflict, contention.Error(), map[string]interface{}{
+		"kind": "recovery_inspection_busy",
+	})
 }
 
 func branchRecoveryConflictResponse(msg *ws.Message, err error) (*ws.Message, error) {
@@ -395,6 +441,9 @@ func (h *Handlers) wsRecoverSession(ctx context.Context, msg *ws.Message) (*ws.M
 	})
 	if err != nil {
 		if recoveryResponse, responseErr := managedCloneRelocationConflictResponse(msg, err); recoveryResponse != nil || responseErr != nil {
+			return recoveryResponse, responseErr
+		}
+		if recoveryResponse, responseErr := recoveryInspectionConflictResponse(msg, err); recoveryResponse != nil || responseErr != nil {
 			return recoveryResponse, responseErr
 		}
 		if recoveryResponse, responseErr := taskArchivedConflictResponse(msg, err); recoveryResponse != nil || responseErr != nil {
