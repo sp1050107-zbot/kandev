@@ -86,6 +86,12 @@ func buildRunningFromExecution(execution *AgentExecution, prior *models.Executor
 		}
 		metadata[MetadataKeyOfficeAgentProfileID] = execution.OfficeAgentProfileID
 	}
+	if execution.OriginalWorkspacePath != "" {
+		if metadata == nil {
+			metadata = make(map[string]interface{})
+		}
+		metadata[MetadataKeyOriginalWorkspacePath] = execution.OriginalWorkspacePath
+	}
 	running := &models.ExecutorRunning{
 		ID:                 executionInventorySessionID(execution),
 		SessionID:          executionInventorySessionID(execution),
@@ -137,6 +143,11 @@ func buildRunningFromExecution(execution *AgentExecution, prior *models.Executor
 			running.Metadata = make(map[string]interface{})
 		}
 		for k, v := range prior.Metadata {
+			if k == metadataKeyPassthroughMCPClaims {
+				// Current execution metadata owns claim state. Copying an absent
+				// claim from a prior row would restore ownership after revocation.
+				continue
+			}
 			if _, ok := running.Metadata[k]; !ok {
 				running.Metadata[k] = v
 			}
@@ -184,6 +195,9 @@ func (m *Manager) resolveLocalPID(execution *AgentExecution) int {
 		return 0
 	}
 	if execution.RuntimeName == agentruntime.RuntimeStandalone {
+		if execution.standaloneHostPID > 0 {
+			return execution.standaloneHostPID
+		}
 		return int(m.standaloneHostPID.Load())
 	}
 	return 0

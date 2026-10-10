@@ -205,10 +205,11 @@ const (
 	ActionSystemMetricsUnsubscribe = "system.metrics.unsubscribe"
 
 	// Message actions
-	ActionMessageAdd    = "message.add"
-	ActionMessageGet    = "message.get"
-	ActionMessageList   = "message.list"
-	ActionMessageSearch = "message.search"
+	ActionMessageAdd                 = "message.add"
+	ActionMessageDismissGitPushError = "message.dismiss_git_push_error"
+	ActionMessageGet                 = "message.get"
+	ActionMessageList                = "message.list"
+	ActionMessageSearch              = "message.search"
 
 	// Notification actions (server -> client)
 	ActionACPProgress                    = "acp.progress"
@@ -327,9 +328,10 @@ const (
 	ActionSystemMetricsUpdated          = "system.metrics.updated"
 	ActionUpdateAvailable               = "system.update_available"
 
-	ActionAgentProfileDeleted = "agent.profile.deleted"
-	ActionAgentProfileCreated = "agent.profile.created"
-	ActionAgentProfileUpdated = "agent.profile.updated"
+	ActionAgentProfileDeleted    = "agent.profile.deleted"
+	ActionAgentProfileCreated    = "agent.profile.created"
+	ActionAgentProfileUpdated    = "agent.profile.updated"
+	ActionAgentProfilesReordered = "agent.profiles.reordered"
 
 	// ActionAgentSettingsUpdated carries a full agent settings record
 	// (dto.AgentDTO) after a settings-side change such as a custom TUI agent's
@@ -567,6 +569,8 @@ const (
 	ActionMCPDeleteExecutorProfile = "mcp.delete_executor_profile"
 
 	ActionMCPMoveTask                    = "mcp.move_task"
+	ActionMCPTransferTask                = "mcp.transfer_task"
+	ActionMCPAuditTaskTransferAttempt    = "mcp.audit_task_transfer_attempt"
 	ActionMCPDeleteTask                  = "mcp.delete_task"
 	ActionMCPArchiveTask                 = "mcp.archive_task"
 	ActionMCPUpdateTaskState             = "mcp.update_task_state"

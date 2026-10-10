@@ -7,9 +7,11 @@ import type { WorkspaceRecoveryProjection } from "@/lib/types/http";
 export type SessionRecoveryAction =
   | "resume"
   | "resume_new_branch"
+  | "continue_from_history"
   | "fresh_start"
   | "runtime_retry"
-  | "relocate_and_resume";
+  | "relocate_and_resume"
+  | "retry_connection";
 
 export type SessionRecoverySettingsPolicy = "provider_restored";
 
@@ -43,6 +45,14 @@ export type SessionRecoveryGuardDetails = WebSocketRequestErrorDetails & {
   kind: "session_recovery_in_progress" | "session_recovery_unstoppable";
   retryable: boolean;
   session_id?: string;
+};
+
+export type ContextContinuationDetails = WebSocketRequestErrorDetails & {
+  kind: "session_restore_required";
+  recovery_action: "continue_from_history";
+  reason?: string;
+  session_id?: string;
+  generation?: number;
 };
 
 export type RecoveryInspectionBusyDetails = WebSocketRequestErrorDetails & {
@@ -143,6 +153,18 @@ export function resolveRequestErrorMessage(
   return fallback;
 }
 
+/** Returns the structured native-state loss context that authorizes history continuation. */
+export function contextContinuationDetails(error: unknown): ContextContinuationDetails | null {
+  if (!(error instanceof WebSocketRequestError) || !isRecord(error.details)) return null;
+  if (
+    error.details.kind !== "session_restore_required" ||
+    error.details.recovery_action !== "continue_from_history"
+  ) {
+    return null;
+  }
+  return error.details as ContextContinuationDetails;
+}
+
 /** Converts unknown request failures into an Error for an inline recovery alert. */
 export function asRecoveryError(error: unknown, fallback: string): Error {
   return error instanceof Error ? error : new Error(fallback);
@@ -172,6 +194,24 @@ export async function requestSessionRecover(options: SessionRecoveryRequest): Pr
   );
   const failure = responseFailure(response, failureMessage);
   if (failure) throw failure;
+}
+
+/** Resume through recovery and retain the workspace projection for the caller. */
+export async function resumeSession(
+  taskId: string,
+  sessionId: string,
+  failureMessage: string,
+): Promise<LaunchSessionResponse> {
+  const client = getWebSocketClient();
+  if (!client) throw new Error(failureMessage);
+  const response = await client.request<LaunchSessionResponse>(
+    "session.recover",
+    { task_id: taskId, session_id: sessionId, action: "resume" },
+    60_000,
+  );
+  const failure = responseFailure(response, failureMessage);
+  if (failure) throw failure;
+  return response;
 }
 
 /** Read current recovery state without reconstructing or inspecting the workspace. */

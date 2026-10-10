@@ -354,6 +354,10 @@ transcript** appears when the first prompt is no longer fully visible. You can
 show or hide each action independently in **Settings → Preferences → Task
 Behavior → Conversation and panels**.
 
+The control also appears when your latest prompt is
+no longer part of the loaded transcript window, as after a long agent run; selecting it
+loads that part of the transcript and aligns the prompt at the top.
+
 For a compact reminder while you read later replies, enable **Show anchored
 prompt bar** in the same settings section. On desktop, it pins a shortened
 copy of your latest prompt below the session tabs once you've scrolled past
@@ -665,6 +669,10 @@ deletion is not success.
 
 ## Find and organize tasks
 
+In **List** view, compact and detailed task rows show critical, high, and low
+priority indicators after the task title on desktop and phones. Medium priority
+remains unmarked.
+
 On desktop and tablet, the header switches between **Kanban**, **Pipeline**,
 **Threads**, and **List**. Kanban and Pipeline show the same workflow steps in
 different layouts. Threads shows agent conversations side by side. Kandev
@@ -827,6 +835,11 @@ Regular tasks have one shared Markdown plan, not a collection of named documents
    - **Run** sends only that comment in plan mode to the task's primary session.
    - After Kandev accepts either action, it removes the delivered comments from the plan and every composer.
 6. Choose **Implement** for the current session or **Implement in fresh agent**. Kandev saves the draft and marks it as sent for implementation. The action stays disabled while a composer attachment is uploading or failed. After implementation starts, the button is disabled for that plan.
+
+If you add a composer instruction when starting implementation, Kandev clears
+that draft only after acceptance and while its text and attachments still match.
+Edits made while implementation starts remain available when you return to that
+session. Starting from the Plan panel leaves an unsent composer draft intact.
 
 Each plan comment supports up to 64 KiB of feedback and 256 KiB of selected
 text. A plan supports up to 100 pending comments and 1 MiB of combined feedback
