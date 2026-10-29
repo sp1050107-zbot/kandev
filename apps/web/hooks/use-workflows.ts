@@ -1,12 +1,13 @@
 import { reconcileTaskWorkflowCoverage } from "@/lib/state/slices/task-workflow-coverage";
 import { useCallback, useEffect, useRef } from "react";
 import { useAppStore, useAppStoreApi } from "@/components/state-provider";
-import { listWorkflows } from "@/lib/api";
+import { readJourneyWorkflows } from "@/hooks/journey-metadata-resources";
 import {
   classifyWorkspaceContextReadError,
   isCurrentWorkspaceContext,
   retryAfterMilliseconds,
 } from "@/lib/state/workspace-context";
+import { mapWorkflowItem } from "@/lib/routing/route-bootstrap";
 import type { AppState } from "@/lib/state/store";
 import type { StoreApi } from "zustand";
 import { useForegroundRefresh } from "./use-foreground-refresh";
@@ -83,6 +84,7 @@ function useWorkflowsFetchEffect(
   useEffect(() => {
     if (!enabled || !workspaceId) return;
     let cancelled = false;
+    const controller = new AbortController();
     const requestId = trackRecovery ? generateUUID() : undefined;
     const generation = store.getState().workspaceContextGeneration;
     const overviewRead = store.getState().beginTaskOverviewRead?.();
@@ -98,7 +100,7 @@ function useWorkflowsFetchEffect(
           requestId,
         );
     }
-    listWorkflows(workspaceId, { cache: "no-store", includeHidden: true })
+    readJourneyWorkflows(store, workspaceId, { includeHidden: true, signal: controller.signal })
       .then((response) => {
         const state = store.getState();
         const staleWorkspaceContext = requireActiveWorkspace
@@ -107,17 +109,7 @@ function useWorkflowsFetchEffect(
         if (cancelled || staleWorkspaceContext) {
           return;
         }
-        const mapped = response.workflows.map((workflow) => ({
-          id: workflow.id,
-          workspaceId: workflow.workspace_id,
-          name: workflow.name,
-          description: workflow.description,
-          prompt: workflow.prompt,
-          sortOrder: workflow.sort_order ?? 0,
-          agent_profile_id: workflow.agent_profile_id,
-          hidden: workflow.hidden,
-          style: workflow.style,
-        }));
+        const mapped = response.workflows.map(mapWorkflowItem);
         setWorkflows(
           mapped,
           reconcileTaskWorkflowCoverage(state, response.task_workflow_coverage, overviewRead),
@@ -163,6 +155,7 @@ function useWorkflowsFetchEffect(
       });
     return () => {
       cancelled = true;
+      controller.abort();
       if (overviewRead) store.getState().finishTaskOverviewRead(overviewRead);
       if (
         trackRecovery &&

@@ -1,6 +1,6 @@
 ---
 name: pr-fixup
-description: Wait for CI and automated reviews on a PR, fix valid failures and comments, disposition every review thread, verify, and push in the primary conversation.
+description: Wait for CI and automated reviews on a PR, handle CI approval according to repository permissions, fix valid failures and comments, disposition every review thread, verify, and push in the primary conversation.
 ---
 
 # PR Fixup
@@ -28,7 +28,7 @@ fallback instead.
 
 Create a visible checklist:
 
-1. Gather PR state
+1. Gather PR state and handle CI authorization
 2. Resolve an authorized PR merge conflict
 3. Fix failing CI checks
 4. Triage every review thread
@@ -58,7 +58,8 @@ If the PR is merged or closed, stop. For a merge, report
 `mergedAt` and `mergeCommit.oid`.
 
 Treat peer alerts as advisory until their SHA matches the current head.
-If captured output is empty, truncated, or invalid, rerun through `rtk proxy`.
+If captured output is empty, truncated, or invalid, rerun the command directly
+and save its unmodified output to a file.
 Capture stdout and stderr separately and preserve the exit code.
 An empty capture cannot prove that the PR is clean.
 
@@ -75,6 +76,21 @@ Keep the helper's exit code unchanged and report any separately verified base dr
 
 For related or stacked PRs, use the semantic-conflict procedure in the same
 reference. Reconcile changed contracts and stable IDs before delivery.
+
+Before waiting and after each push, check `approval_required_runs` for the
+current head. An explicit fixup request authorizes approval of those runs.
+Check the authenticated actor's base-repository access with
+`gh repo view <base-owner>/<base-repo> --json viewerPermission`.
+If the actor has write access, inspect the PR changes, including workflow
+changes, then approve each matching run with
+`gh api --method POST repos/<base-owner>/<base-repo>/actions/runs/<run-id>/approve`.
+Poll the run until the current-head workflow is queued, running, or finished
+with a conclusion other than `action_required`; then use `scripts/pr-await`.
+An approval response alone does not confirm that CI started.
+If the actor cannot approve, address review comments, run local checks, and
+push permitted fixes. Then end the turn reporting that CI awaits maintainer
+approval. If access is unknown or approval fails, report the blocker without
+calling CI clean. A read-only poller cannot approve workflows.
 
 For pending checks, load [waiting.md](references/waiting.md).
 Use `scripts/pr-await` and its final exit code.
@@ -108,9 +124,14 @@ not flood the conversation. If it returns only GitHub request/transport lines
 or no failure text, treat logs as unavailable and, after terminal state, use
 `scripts/pr-state --job-log <job_id>`. For temporary gaps or aggregate-only
 logs, use the same fallback; it handles plain-text and ZIP responses and emits
-bounded context. Follow `references/ci-troubleshooting.md`. Reproduce the exact
-failed command where possible; CI-specific Go lint often needs
-`golangci-lint run ./... --new-from-rev=<base> --timeout=5m`.
+bounded context. Follow `references/ci-troubleshooting.md`. Reproduce the failing
+scope locally. For Go lint, use `bash scripts/lint-go-changed <changed-go-files>`
+from the repository root, including any file named by the failure. Follow
+`apps/backend/AGENTS.md` for PR-base selection and resource defaults. CI owns the
+full-backend scan; `--new-from-rev` only filters reported findings. Run lint and
+race/build suites sequentially. If the scoped check cannot reproduce CI, use its
+logs before expanding local scope; a full local scan requires explicit user
+authorization and OS-level resource limits.
 
 Bind every failed status and workflow run to the current PR head SHA and the
 current run attempt before acting. Older red runs can remain visible after a
@@ -289,8 +310,11 @@ the legal minimum width. Verify the actual hit target (for example,
 Commit through `/commit`, then rerun only the unit, integration, or E2E command
 affected by the remediation. Push when that targeted check passes for the exact
 current `HEAD`. For a cross-repository PR, push the exact current `HEAD` to the
-summary's authoritative head repository and ref only when
-`pr.maintainer_can_modify` is true. Re-fetch the PR afterward and require its
+summary's authoritative head repository and ref.
+The authenticated head-repository owner can push their own fork directly.
+For maintainer edits to another owner's fork, require
+`pr.maintainer_can_modify=true` and push permission.
+Re-fetch the PR afterward and require its
 `pr.head_ref_oid` to equal local `HEAD`; an upstream remote comparison is not
 sufficient. Run broad `/verify` only if the user explicitly requests it or the
 PR/CI finding requires it.
@@ -306,10 +330,13 @@ fixup and recapture and re-publish every affected viewport after the final
 commit. Never leave pre-fixup screenshots in the PR.
 Anchor each recapture on the promised user-visible notice or download affordance
 and assert that affordance is visible before capture; a preview container alone
-is not evidence of the behavior. If the UI changes after publication, publish
-the replacement on a new immutable ref such as
-`media/pr-<PR_NUMBER>-screenshots-fixup` instead of rewriting the prior media
-ref, then repeat the live-body compare-and-swap procedure.
+is not evidence of the behavior. If the UI changes after publication, upload
+the fresh assets with `gh pr comment --body-file <screenshots-file> --attach
+<path>` (repeat `--attach` for each asset) using `/pr` step 7. After uploading,
+replace only the owned screenshot section through its live-body
+fetch/merge/check procedure, without attachments on the body edit, and
+verify the uploaded embeds by reading the PR body back. Do not create or
+rewrite media refs; preserve legacy refs used by historical PR embeds.
 
 Immediately before a remediation commit or push—and again after long-running
 remediation—refresh PR state. Require the PR to remain open and its head ref to
@@ -334,8 +361,9 @@ skill/reference file, run the shared harness validation in
 
 After every push, re-fetch current-head state and run
 `scripts/pr-resolve list <PR>` (and `show` for any thread you may answer), then
-`scripts/pr-state --summary <PR>` again for the new head. For explicit
-consolidation, verify the target head before commenting/closing the superseded
+`scripts/pr-state --summary <PR>` again for the new head.
+Recheck CI approval for the new head before waiting.
+For explicit consolidation, verify the target head before commenting/closing the superseded
 PR; preserve its branch unless deletion is requested. Automated reviewers may
 resolve or replace threads; do not reply to or resolve a thread that fresh state
 reports as resolved unless an authorized later code/policy change invalidates
@@ -455,4 +483,4 @@ For "monitor until merge", poll queue/PR state with bounded cadence; require
 - Do not silently dismiss an invalid finding; every invalid thread needs a
   concrete pushback disposition, and an authorized fixup or complete cleanup
   must post that explanation before resolving it.
-- Do not proceed with an unverified PR when mandatory verification is blocked.
+- Do not merge or declare the PR clean while mandatory verification is blocked.

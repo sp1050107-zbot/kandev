@@ -1,6 +1,42 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiClient, removeRoutingProfileReferences } from "./api-client";
 import { loadInterimSettingsInterlockToken } from "./interim-settings-interlock";
+import type { Agent } from "../../lib/types/http-agents";
+
+describe("ApiClient.cleanupTestProfiles", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("uses the provided agent snapshot instead of fetching it again", async () => {
+    const requests: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        requests.push(url);
+        if (url.endsWith("/api/v1/app-state?path=%2Fsettings%2Fagents")) {
+          return Response.json({ interimSettingsInterlockToken: "test-token" });
+        }
+        if (url.endsWith("/api/v1/agents")) {
+          return Response.json({ agents: [], total: 0 });
+        }
+        if (url.endsWith("/api/v1/agent-profiles/profile-1?force=true")) {
+          return new Response(null, { status: 204 });
+        }
+        throw new Error(`unexpected request: ${url}`);
+      }),
+    );
+    const agents = [{ id: "mock-agent", profiles: [{ id: "profile-1" }] }] as unknown as Agent[];
+
+    await new ApiClient("http://backend.test").cleanupTestProfiles(["keep"], agents);
+
+    expect(requests).toEqual([
+      "http://backend.test/api/v1/app-state?path=%2Fsettings%2Fagents",
+      "http://backend.test/api/v1/agent-profiles/profile-1?force=true",
+    ]);
+  });
+});
 
 describe("ApiClient.createAgentProfile", () => {
   afterEach(() => {
@@ -313,5 +349,45 @@ describe("ApiClient.e2eReset", () => {
       );
     await expect(client.e2eReset("workspace-1")).rejects.toThrow("session transfer in progress");
     expect(request).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe("explicit session detail inspection", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("keeps list reads compact and fetches rich data only for explicit detail inspection", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/tasks/task/sessions"))
+        return Response.json({
+          sessions: [
+            {
+              id: "session",
+              task_id: "task",
+              state: "RUNNING",
+              queue_incarnation_id: "incarnation",
+            },
+          ],
+          total: 1,
+        });
+      if (url.endsWith("/task-sessions/session"))
+        return Response.json({
+          session: {
+            id: "session",
+            task_id: "task",
+            state: "RUNNING",
+            metadata: { acp: { session_id: "native" } },
+          },
+        });
+      throw new Error(`unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ApiClient("http://backend.test");
+    expect((await client.listTaskSessions("task")).sessions[0].metadata).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((await client.listTaskSessionDetails("task")).sessions[0]).toMatchObject({
+      queue_incarnation_id: "incarnation",
+      metadata: { acp: { session_id: "native" } },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 });

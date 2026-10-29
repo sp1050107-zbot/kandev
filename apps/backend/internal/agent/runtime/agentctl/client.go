@@ -8,16 +8,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/kandev/kandev/internal/agentctl/journal"
 	"github.com/kandev/kandev/internal/agentctl/tracing"
 	"github.com/kandev/kandev/internal/agentctl/types"
 	"github.com/kandev/kandev/internal/agentctl/types/streams"
+	"github.com/kandev/kandev/internal/common/launchwrapper"
 	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/common/processidentity"
 	"github.com/kandev/kandev/internal/mcp/plugintools"
 	ws "github.com/kandev/kandev/pkg/websocket"
 	"go.uber.org/zap"
@@ -43,6 +47,8 @@ type Client struct {
 
 	// WebSocket connections for streaming
 	agentStreamConn     *websocket.Conn
+	updatesDial         *updatesStreamDial
+	updatesDialSequence uint64
 	workspaceStreamConn *websocket.Conn
 	// workspaceStream is the most-recent workspace stream returned by
 	// StreamWorkspace, retained so Client.Close can wait for its read/write
@@ -74,6 +80,14 @@ type Client struct {
 	// policy evaluation can use it before the event reaches its handler.
 	lastSessionModelState *streams.SessionModelState
 
+	// Session capabilities are populated by the ACP initialize response and
+	// used by idle-session MCP reconfiguration to choose resume versus load.
+	supportsSessionResume bool
+	supportsSessionLoad   bool
+
+	// lastAttachmentAttemptID is returned by session/load and session/resume
+	// after the backend starts its evidence timeline.
+	lastAttachmentAttemptID string
 	// durableDelivery records the agentctl transport capability returned during
 	// initialize. It is separate from ACP capabilities because it describes the
 	// retained agentctl-to-backend journal rather than the native harness.
@@ -89,6 +103,24 @@ type Client struct {
 	lastDeliverySubmissionID string
 }
 
+type updatesStreamDial struct {
+	sequence     uint64
+	ctx          context.Context
+	streamCtx    context.Context
+	cancel       context.CancelFunc
+	streamCancel context.CancelFunc
+	conn         net.Conn
+	stopConn     func() bool
+	retired      bool
+}
+
+type updatesStreamDialCleanup struct {
+	cancel       context.CancelFunc
+	streamCancel context.CancelFunc
+	conn         net.Conn
+	stopConn     func() bool
+}
+
 func (c *Client) setLastSessionModelState(state *streams.SessionModelState) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -101,6 +133,46 @@ func (c *Client) GetLastSessionModelState() *streams.SessionModelState {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return cloneSessionModelState(c.lastSessionModelState)
+}
+
+// SupportsSessionResume reports the capability negotiated by initialize.
+func (c *Client) SupportsSessionResume() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.supportsSessionResume
+}
+
+// SupportsSessionLoad reports the capability negotiated by initialize.
+func (c *Client) SupportsSessionLoad() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.supportsSessionLoad
+}
+
+// GetLastAttachmentAttemptID returns the most recent backend-owned MCP
+// attachment attempt returned by an agentctl session operation.
+func (c *Client) GetLastAttachmentAttemptID() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastAttachmentAttemptID
+}
+
+func (c *Client) setSessionCapabilities(info *AgentInfo) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if info == nil {
+		c.supportsSessionResume = false
+		c.supportsSessionLoad = false
+		return
+	}
+	c.supportsSessionResume = info.SupportsSessionResume
+	c.supportsSessionLoad = info.SupportsSessionLoad
+}
+
+func (c *Client) setLastAttachmentAttemptID(attemptID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastAttachmentAttemptID = attemptID
 }
 
 func cloneSessionModelState(state *streams.SessionModelState) *streams.SessionModelState {
@@ -180,8 +252,16 @@ func (c *Client) getTraceCtx() context.Context {
 
 // StatusResponse from agentctl
 type StatusResponse struct {
-	AgentStatus string                 `json:"agent_status"`
-	ProcessInfo map[string]interface{} `json:"process_info"`
+	DeliveryHealth struct {
+		State               string                         `json:"state"`
+		CancellationPending bool                           `json:"cancellation_pending"`
+		ProducerPaused      bool                           `json:"producer_paused"`
+		Capacity            journal.Capacity               `json:"capacity"`
+		Failure             *types.DeliveryFailureSnapshot `json:"failure,omitempty"`
+	} `json:"delivery_health"`
+	RuntimeStorage *streams.RuntimeStorageSnapshot `json:"runtime_storage,omitempty"`
+	AgentStatus    string                          `json:"agent_status"`
+	ProcessInfo    map[string]interface{}          `json:"process_info"`
 }
 
 // IsAgentRunning returns true if the agent process is running or starting
@@ -251,6 +331,14 @@ func (c *Client) RuntimeProcessID() int {
 	return c.runtimeGuard.binding.processID
 }
 
+// RuntimeProcessIdentity retains the authenticated local runtime's birth identity.
+func (c *Client) RuntimeProcessIdentity() processidentity.Identity {
+	if c == nil || c.runtimeGuard == nil || c.runtimeGuard.binding == nil {
+		return processidentity.Identity{}
+	}
+	return c.runtimeGuard.binding.processIdentity
+}
+
 // RuntimeCurrent reports whether this client still targets the published
 // local runtime generation. Clients owned by remote executors are unbound and
 // remain current for this purpose.
@@ -265,11 +353,193 @@ func (c *Client) RuntimeBoundContext(ctx context.Context) (context.Context, cont
 	if c == nil {
 		return nil, func() {}, errors.New("agentctl client is nil")
 	}
-	boundCtx, cancel, err := c.runtimeGuard.bindContext(ctx)
+	return c.runtimeGuard.bindContext(ctx)
+}
+
+func (c *Client) beginUpdatesStreamDial(ctx context.Context) (*updatesStreamDial, context.Context, error) {
+	streamCtx, streamCancel, err := c.RuntimeBoundContext(ctx)
 	if err != nil {
-		return nil, func() {}, err
+		return nil, nil, err
 	}
-	return boundCtx, cancel, nil
+	dialCtx, dialCancel := context.WithCancel(streamCtx)
+	attempt := &updatesStreamDial{
+		ctx:          dialCtx,
+		streamCtx:    streamCtx,
+		cancel:       dialCancel,
+		streamCancel: streamCancel,
+	}
+
+	c.mu.Lock()
+	c.updatesDialSequence++
+	attempt.sequence = c.updatesDialSequence
+	previous := c.takeUpdatesStreamDialLocked()
+	c.updatesDial = attempt
+	c.mu.Unlock()
+	closeUpdatesStreamDial(previous)
+
+	return attempt, streamCtx, nil
+}
+
+func (c *Client) takeUpdatesStreamDialLocked() updatesStreamDialCleanup {
+	attempt := c.updatesDial
+	if attempt == nil {
+		return updatesStreamDialCleanup{}
+	}
+	c.updatesDial = nil
+	attempt.retired = true
+	cleanup := updatesStreamDialCleanup{
+		cancel:       attempt.cancel,
+		streamCancel: attempt.streamCancel,
+		conn:         attempt.conn,
+		stopConn:     attempt.stopConn,
+	}
+	attempt.conn = nil
+	attempt.stopConn = nil
+	return cleanup
+}
+
+func closeUpdatesStreamDial(cleanup updatesStreamDialCleanup) {
+	if cleanup.stopConn != nil {
+		cleanup.stopConn()
+	}
+	if cleanup.cancel != nil {
+		cleanup.cancel()
+	}
+	if cleanup.streamCancel != nil {
+		cleanup.streamCancel()
+	}
+	if cleanup.conn != nil {
+		_ = cleanup.conn.Close()
+	}
+}
+
+func (c *Client) registerUpdatesStreamDialConn(attempt *updatesStreamDial, conn net.Conn) error {
+	stopConn := context.AfterFunc(attempt.ctx, func() { _ = conn.Close() })
+	c.mu.Lock()
+	if attempt.retired || c.updatesDial != attempt || c.updatesDialSequence != attempt.sequence || attempt.ctx.Err() != nil {
+		err := attempt.ctx.Err()
+		c.mu.Unlock()
+		stopConn()
+		_ = conn.Close()
+		if err != nil {
+			return err
+		}
+		return context.Canceled
+	}
+	attempt.conn = conn
+	attempt.stopConn = stopConn
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Client) retireUpdatesStreamDial(attempt *updatesStreamDial) {
+	c.mu.Lock()
+	var cleanup updatesStreamDialCleanup
+	if c.updatesDial == attempt {
+		c.updatesDialSequence++
+		cleanup = c.takeUpdatesStreamDialLocked()
+	}
+	c.mu.Unlock()
+	closeUpdatesStreamDial(cleanup)
+}
+
+func (c *Client) completeUpdatesStreamDial(
+	attempt *updatesStreamDial,
+	conn *websocket.Conn,
+) (context.CancelFunc, error) {
+	stopStream := context.AfterFunc(attempt.streamCtx, func() { _ = conn.Close() })
+	c.mu.Lock()
+	if attempt.retired || c.updatesDial != attempt || c.updatesDialSequence != attempt.sequence || attempt.ctx.Err() != nil || attempt.streamCtx.Err() != nil {
+		err := updatesStreamDialContextError(attempt)
+		if err == nil {
+			err = context.Canceled
+		}
+		var cleanup updatesStreamDialCleanup
+		if c.updatesDial == attempt {
+			c.updatesDialSequence++
+			cleanup = c.takeUpdatesStreamDialLocked()
+		}
+		c.mu.Unlock()
+		return rejectCompletedUpdatesStreamDial(stopStream, cleanup, conn, err)
+	}
+
+	stopConn := attempt.stopConn
+	if stopConn != nil && !stopConn() {
+		c.updatesDialSequence++
+		cleanup := c.takeUpdatesStreamDialLocked()
+		c.mu.Unlock()
+		return rejectCompletedUpdatesStreamDial(stopStream, cleanup, conn, context.Canceled)
+	}
+	if err := updatesStreamDialContextError(attempt); err != nil {
+		c.updatesDialSequence++
+		cleanup := c.takeUpdatesStreamDialLocked()
+		c.mu.Unlock()
+		return rejectCompletedUpdatesStreamDial(stopStream, cleanup, conn, err)
+	}
+
+	attempt.stopConn = nil
+	attempt.conn = nil
+	attempt.retired = true
+	c.updatesDial = nil
+	c.agentStreamConn = conn
+	streamCancel := attempt.streamCancel
+	dialCancel := attempt.cancel
+	c.mu.Unlock()
+
+	if err := updatesStreamDialContextError(attempt); err != nil {
+		c.mu.Lock()
+		if c.agentStreamConn == conn {
+			c.agentStreamConn = nil
+		}
+		c.mu.Unlock()
+		stopStream()
+		_ = conn.Close()
+		dialCancel()
+		streamCancel()
+		return nil, err
+	}
+	dialCancel()
+	return func() {
+		stopStream()
+		streamCancel()
+	}, nil
+}
+
+func rejectCompletedUpdatesStreamDial(
+	stopStream func() bool,
+	cleanup updatesStreamDialCleanup,
+	conn *websocket.Conn,
+	err error,
+) (context.CancelFunc, error) {
+	stopStream()
+	closeUpdatesStreamDial(cleanup)
+	_ = conn.Close()
+	return nil, err
+}
+
+func updatesStreamDialContextError(attempt *updatesStreamDial) error {
+	if err := attempt.ctx.Err(); err != nil {
+		return err
+	}
+	if err := attempt.streamCtx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) takeUpdatesStreamLocked() (updatesStreamDialCleanup, *websocket.Conn) {
+	c.updatesDialSequence++
+	cleanup := c.takeUpdatesStreamDialLocked()
+	conn := c.agentStreamConn
+	c.agentStreamConn = nil
+	return cleanup, conn
+}
+
+func closeUpdatesStream(cleanup updatesStreamDialCleanup, conn *websocket.Conn) {
+	closeUpdatesStreamDial(cleanup)
+	if conn != nil {
+		_ = conn.Close()
+	}
 }
 
 // ProxyTransport returns the same authenticated upstream transport used by
@@ -321,10 +591,8 @@ func (t *instanceIDTransport) RoundTrip(req *http.Request) (*http.Response, erro
 
 // wsAuthHeaders returns HTTP headers for WebSocket dial calls.
 func (c *Client) wsAuthHeaders() http.Header {
-	if c.authToken == "" && c.executionID == "" {
-		return nil
-	}
 	h := http.Header{}
+	h.Set("X-Kandev-Delivery-Version", "2")
 	if c.authToken != "" {
 		h.Set("Authorization", "Bearer "+c.authToken)
 	}
@@ -395,30 +663,39 @@ func (c *Client) GetStatus(ctx context.Context) (*StatusResponse, error) {
 
 // ConfigureAgent configures the agent command. Must be called before Start().
 // continueCommand is optional — when set, the adapter uses it for one-shot follow-up prompts.
-func (c *Client) ConfigureAgent(ctx context.Context, command string, agentArgs []string, env map[string]string, continueCommand string, continueArgs []string) error {
-	return c.configureAgent(ctx, command, agentArgs, env, continueCommand, continueArgs, false)
+func (c *Client) ConfigureAgent(ctx context.Context, command string, agentArgs []string, env map[string]string, continueCommand string, continueArgs []string, wrapper ...launchwrapper.Spec) error {
+	return c.configureAgent(ctx, command, agentArgs, env, continueCommand, continueArgs, false, wrapper...)
 }
 
 // ConfigureAgentWithEnvironment configures the agent with a complete effective
 // environment. The agentctl instance replaces its indexed Git configuration
 // block while preserving ordinary instance variables. Use this when the
 // caller has already composed inherited and generated environment sources.
-func (c *Client) ConfigureAgentWithEnvironment(ctx context.Context, command string, agentArgs []string, env map[string]string, continueCommand string, continueArgs []string) error {
-	return c.configureAgent(ctx, command, agentArgs, env, continueCommand, continueArgs, true)
+func (c *Client) ConfigureAgentWithEnvironment(ctx context.Context, command string, agentArgs []string, env map[string]string, continueCommand string, continueArgs []string, wrapper ...launchwrapper.Spec) error {
+	return c.configureAgent(ctx, command, agentArgs, env, continueCommand, continueArgs, true, wrapper...)
 }
 
-func (c *Client) configureAgent(ctx context.Context, command string, agentArgs []string, env map[string]string, continueCommand string, continueArgs []string, replaceEnv bool) error {
+func (c *Client) configureAgent(ctx context.Context, command string, agentArgs []string, env map[string]string, continueCommand string, continueArgs []string, replaceEnv bool, wrapper ...launchwrapper.Spec) error {
 	ctx, span := tracing.TraceHTTPRequest(ctx, "POST", "/api/v1/agent/configure", c.executionID)
 	defer span.End()
 
+	spec := launchwrapper.Spec{}
+	if len(wrapper) > 0 {
+		spec = wrapper[0]
+	}
+	if err := c.requireLaunchWrapper(ctx, spec); err != nil {
+		return err
+	}
 	payload := struct {
-		Command         string            `json:"command"`
-		AgentArgs       *[]string         `json:"agent_args,omitempty"`
-		ContinueCommand string            `json:"continue_command,omitempty"`
-		ContinueArgs    *[]string         `json:"continue_args,omitempty"`
-		Env             map[string]string `json:"env,omitempty"`
-		ReplaceEnv      bool              `json:"replace_env,omitempty"`
+		LaunchWrapper   launchwrapper.Spec `json:"launch_wrapper,omitzero"`
+		Command         string             `json:"command"`
+		AgentArgs       *[]string          `json:"agent_args,omitempty"`
+		ContinueCommand string             `json:"continue_command,omitempty"`
+		ContinueArgs    *[]string          `json:"continue_args,omitempty"`
+		Env             map[string]string  `json:"env,omitempty"`
+		ReplaceEnv      bool               `json:"replace_env,omitempty"`
 	}{
+		LaunchWrapper:   spec,
 		Command:         command,
 		ContinueCommand: continueCommand,
 		Env:             env,
@@ -947,6 +1224,7 @@ type (
 func (c *Client) Close() {
 	c.mu.Lock()
 	c.closed = true
+	updatesDial, agentConn := c.takeUpdatesStreamLocked()
 	ws := c.workspaceStream
 	connections := make([]*websocket.Conn, 0, len(c.runtimeConns))
 	stops := make([]func() bool, 0, len(c.runtimeConns))
@@ -956,6 +1234,7 @@ func (c *Client) Close() {
 	}
 	c.runtimeConns = nil
 	c.mu.Unlock()
+	closeUpdatesStream(updatesDial, agentConn)
 	for _, stop := range stops {
 		stop()
 	}
@@ -963,7 +1242,6 @@ func (c *Client) Close() {
 		_ = conn.Close()
 	}
 
-	c.CloseUpdatesStream()
 	// CloseWorkspaceStream closes the raw conn to wake the blocked read loop.
 	// ws.Close (below) is needed to close the writeLoop's closeCh; closeOnce
 	// makes ws.Close idempotent so the duplicate conn.Close it issues just

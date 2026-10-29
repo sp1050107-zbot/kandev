@@ -11,16 +11,18 @@ owners:
 
 ## Purpose
 
-The task and workflow system owns durable work items, task relationships,
-execution lifecycle, workflow steps, queued launches, and the contracts that
-move a task through its configured process.
+Owns durable work items, task relationships, execution lifecycle, workflow
+steps, queued launches, and task process contracts.
 
 ## Ownership
 
-This system owns task identity and metadata, task documents and attachments,
-parent and dependency relationships, task creation and launch behavior, task
-runtime state publication, workflow definitions and transitions, completion
-signals, and task-scoped scheduling contracts.
+Owns task identity, metadata, [workspace discovery](requirements/workspace-search.md),
+documents, attachments, hierarchy, creation, launch, runtime state, workflows,
+completion, and scheduling.
+
+Turn change sets bind immutable repository intervals to capture policy,
+history, and transcript anchors. Workspaces own checkout identity; runtime owns
+ordered executor access.
 
 ## Exclusions
 
@@ -68,6 +70,7 @@ signals, and task-scoped scheduling contracts.
 - [Link Existing Task to External References](requirements/link-existing-task-github-issue.md)
 - [MCP-Created Task Agent Profile Default](requirements/mcp-task-agent-profile-default.md)
 - [MCP Tool Name Stability](requirements/mcp-tool-name-stability.md)
+- [MCP task priority](requirements/mcp-task-priority.md)
 - [MCP workspace modes](requirements/mcp-workspace-mode.md)
 - [Missing task route recovery](requirements/missing-task-route-recovery.md)
 - [Task model unification](requirements/model-unification.md)
@@ -92,6 +95,7 @@ signals, and task-scoped scheduling contracts.
 - [Task Runtime Cleanup](requirements/runtime-cleanup.md)
 - [Managed Branch Compaction](requirements/managed-branch-compaction.md)
 - [Task Terminal Persistence](requirements/task-terminal-persistence.md)
+- [Terminal target lifecycle](requirements/terminal-target-lifecycle.md)
 - [Runtime Task-State Publication Order](requirements/runtime-state-publication-order.md)
 - [Session Delete Preserves Task Workspaces](requirements/session-delete-resource-cleanup.md)
 - [Task Cleanup Source Manifest](requirements/archive-source-manifest.md)
@@ -104,6 +108,7 @@ signals, and task-scoped scheduling contracts.
 - [Task Actions Menu Action Outcomes](requirements/task-actions-menu-outcomes.md)
 - [Subtasks as Workflow Checklist](requirements/subtask-checklist.md)
 - [Subtask Completion Trigger](requirements/subtask-completion-trigger.md)
+- [Workflow PR Lifecycle Events](requirements/workflow-pr-lifecycle-events.md)
 - [Subtask detachment](requirements/subtask-detachment.md)
 - [Subtask re-parenting by drag and drop](requirements/subtask-reparenting-drag-drop.md)
 - [Task Subtree Controls](requirements/subtree-controls.md)
@@ -170,6 +175,7 @@ signals, and task-scoped scheduling contracts.
 - [External task ID idempotency operations](system-design/external-id-idempotency-operations.md)
 - [External task ID idempotency](system-design/external-id-idempotency.md)
 - [Task model unification](system-design/model-unification.md)
+- [Workflow PR Lifecycle Events](system-design/workflow-pr-lifecycle-events.md)
 - [MCP Tool Name Stability](system-design/mcp-tool-name-stability.md)
 - [MCP workspace modes](system-design/mcp-workspace-mode.md)
 - [Remote Contribution Tasks](system-design/remote-contribution-tasks.md)
@@ -194,6 +200,7 @@ signals, and task-scoped scheduling contracts.
 - [Managed Branch Compaction](system-design/managed-branch-compaction.md)
 - [Task Cleanup Preparation](system-design/runtime-cleanup-preparation.md)
 - [Task Terminal Persistence](system-design/task-terminal-persistence.md)
+- [Terminal target lifecycle](system-design/terminal-target-lifecycle.md)
 - [Runtime Task-State Publication Order](system-design/runtime-state-publication-order.md)
 - [Queued Run Scheduling](system-design/run-scheduling.md)
 - [Resume prompt queue](system-design/resume-prompt-queue.md)
@@ -210,6 +217,7 @@ signals, and task-scoped scheduling contracts.
 - [Audited cross-workspace task transfers](system-design/cross-workspace-task-transfer.md)
 - [Task Create Launch Preview](system-design/task-create-launch-preview.md)
 - [Task priority visibility](system-design/task-priority-visibility.md)
+- [MCP task priority](system-design/mcp-task-priority.md)
 - [Board priority sort and filter](system-design/board-priority-sort-filter.md)
 - [Threads task actions](system-design/threads-task-actions.md)
 - [WIP Limits and Visible Overflow Queues](system-design/wip-limit-pull-system.md)

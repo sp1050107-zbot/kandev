@@ -84,8 +84,10 @@ cases; `background_work_attestation_test.go`; task repository
   domain hook/store drives desktop and phone. New reads/mutations are gated
   server-side; old adapters/clients retain current behavior.
 - The shared gate is `features.agentBackgroundWork`, independent of
-  `features.codexAppServer` and Claude prompt handoff; all shipped defaults off.
-  Apply `/runtime-feature-flags` during implementation and trace every entry path.
+  `features.codexAppServer` and Claude prompt handoff. Its initial rollout used
+  all-off defaults. The later [default-on work order](../opencode-background-continuity/task-07-default-on-rollout.md)
+  promotes the shared gate and retains its operator off switch.
+  Apply `/runtime-feature-flags` and trace every entry path.
 - Platform owns the additive [explicit steering contract](../../specs/platform/system-design/explicit-turn-steering.md).
   Task 07 implements exact-turn native dispatch and durable delivery receipts;
   Task 08 adds explicit composer choice. `features.sameTurnSteering` is off in
@@ -325,6 +327,7 @@ real provider support. Existing subagent E2E remains part of Task 05 regression.
 - [ ] [07: Native same-turn steering and delivery receipts](task-07-native-turn-steering.md)
 - [ ] [08: Explicit composer delivery on desktop and phone](task-08-steering-composer.md)
 - [ ] [06: Executor conformance fixtures and public guidance](task-06-executor-conformance-and-docs.md)
+- [x] [09: Settle workloads whose owning agent process is gone](task-09-settle-orphaned-workloads.md)
 
 Execute sequentially in the order above: 01, 02, 03, 04, 05, 07, 08, 06.
 Existing work-order IDs remain stable; Task 06 now follows the steering UI. No delegation or implementation is authorized by this plan.
@@ -348,6 +351,12 @@ production files were changed. Public-doc updates belong to Task 06 when the
 behavior is implemented, not to this design-only change.
 
 ## Risks and evidence limits
+
+The [OpenCode continuity extension](../opencode-background-continuity/plan.md)
+uses the implemented shared observation/viewer seams. It owns its upstream
+producer dependency and OpenCode-specific work orders. Its delivery does not
+complete this package's pending native-steering Tasks 07/08 or change their
+recorded results.
 
 - Live Codex child correlation and exact usage remain unproven by the PR's
   earlier live suite. Task 03/06 evidence must distinguish observed/unsupported/

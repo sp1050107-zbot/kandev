@@ -23,19 +23,27 @@ import {
 import { useTranslation } from "react-i18next";
 import { isDetachedManagedConversation } from "@/lib/plugins/retained-managed-conversation";
 import { RetainedManagedConversationTranscript } from "@/components/plugins/retained-managed-conversation-transcript";
+import { captureActiveTurnWindowObservations } from "@/lib/state/slices/session/turn-actions";
 import { captureTaskSessionHydrationEpochs } from "@/lib/state/slices/session/hydration-epochs";
 import type { TaskSessionHydrationEpoch } from "@/lib/state/slices/session/types";
 import {
   beginTaskNavigation,
   isTaskNavigationCurrent,
+  isTemporaryTaskNavigationError,
   retainTaskNavigationRead,
   readTaskNavigationIdentity,
   useTaskNavigationReadState,
 } from "@/lib/state/task-navigation-reads";
 import type { TaskNavigationContext } from "@/lib/state/task-navigation-reads";
+import { TaskLoadErrorState } from "@/components/task/task-page-content";
 import { getOwnedTaskSessionId, useTaskRouteProjection } from "./task-route-projection";
 import { useTaskDetailRouteRecovery } from "./task-detail-route-recovery";
 import { deriveTaskDetailRouteView } from "./task-detail-route-view";
+import {
+  assertRequestedSession,
+  TaskSessionAdmissionError,
+  TaskSessionUnavailable,
+} from "./task-session-admission";
 import type { TaskDetailRouteState } from "./task-detail-route-state";
 
 type TaskDetailRouteProps = {
@@ -104,8 +112,19 @@ export function TaskDetailRoute({
     (route.currentRouteStatus === "loaded" &&
       (route.initialState === null || hydratedState === route.initialState));
 
+  if (route.sessionAdmission) {
+    return (
+      <TaskSessionUnavailable
+        retry={route.sessionAdmission === "read_failed" ? route.retrySessionRead : undefined}
+      />
+    );
+  }
+
   if (route.showInitialLoading) {
-    return <TaskRouteLoading retrying={route.readState.phase === "retrying"} />;
+    if (route.readState.phase === "retrying") {
+      return <TaskLoadErrorState temporaryError retrying onRetry={route.retrySessionRead} />;
+    }
+    return <TaskRouteLoading />;
   }
 
   return (
@@ -146,6 +165,7 @@ function TaskDetailRouteBody({
           initialState={route.initialState}
           sessionId={route.forceMergeSession ? (route.activeSessionId ?? undefined) : undefined}
           taskSessionHydrationEpochsAtRequestStart={route.hydrationEpochsAtRequestStart}
+          turnWindowObservationsAtRequestStart={route.turnWindowObservationsAtRequestStart}
           onHydrated={onRouteHydrated}
         />
       ) : null}
@@ -239,7 +259,7 @@ function useTaskDetailRouteData({
     taskId,
     sessionId,
   );
-  useTaskDetailRouteFetch({
+  const retrySessionRead = useTaskDetailRouteFetch({
     taskId,
     sessionId,
     selectedSessionId: selectedSessionForNavigation,
@@ -275,6 +295,7 @@ function useTaskDetailRouteData({
     routeSessionId: sessionId,
     selectedSessionId: selectedSessionForNavigation,
     projection,
+    readState,
   });
   useTaskDetailRouteEnrichment({
     view,
@@ -283,7 +304,7 @@ function useTaskDetailRouteData({
     setRouteState,
     previousLoadedRouteRef,
   });
-  return { ...view, readState };
+  return { ...view, readState, retrySessionRead };
 }
 
 function useTaskDetailRouteEnrichment(args: {
@@ -316,6 +337,7 @@ function useTaskDetailRouteEnrichment(args: {
       forceMergeSession: false,
       navigationContext,
       hydrationEpochsAtRequestStart: view.hydrationEpochsAtRequestStart,
+      turnWindowObservationsAtRequestStart: view.turnWindowObservationsAtRequestStart,
     };
     previousLoadedRouteRef.current = shellState;
     setRouteState((current) =>
@@ -329,6 +351,9 @@ function useTaskDetailRouteEnrichment(args: {
       store.getState(),
       view.data.task.id,
     );
+    const turnWindowObservationsAtRequestStart = captureActiveTurnWindowObservations(
+      store.getState(),
+    );
     void fetchTaskNavigationEnrichment(identity, view.data.sessionId ?? undefined, { store })
       .then((enriched) => {
         if (!isTaskNavigationCurrent(store, navigationContext)) return;
@@ -336,6 +361,7 @@ function useTaskDetailRouteEnrichment(args: {
           ...shellState,
           data: enriched,
           hydrationEpochsAtRequestStart,
+          turnWindowObservationsAtRequestStart,
         };
         const previousLoadedRoute = previousLoadedRouteRef.current;
         if (
@@ -369,6 +395,7 @@ function useTaskDetailRouteEnrichment(args: {
     view.displayedRouteKey,
     view.enrichmentIdentity,
     view.hydrationEpochsAtRequestStart,
+    view.turnWindowObservationsAtRequestStart,
     view.navigationContext,
     view.routeKey,
     view.currentRouteStatus,
@@ -386,7 +413,7 @@ function resolveCurrentRouteState(
   return initialRouteState(routeInitialData, taskId, sessionId);
 }
 
-function useTaskDetailRouteFetch(args: {
+type TaskDetailRouteFetchArgs = {
   taskId: string;
   sessionId?: string;
   selectedSessionId?: string;
@@ -399,7 +426,9 @@ function useTaskDetailRouteFetch(args: {
   hydrationEpochsAtRequestStartRef: MutableRefObject<
     Readonly<Record<string, TaskSessionHydrationEpoch>> | undefined
   >;
-}) {
+};
+
+function useTaskDetailRouteFetch(args: TaskDetailRouteFetchArgs) {
   const {
     taskId,
     sessionId,
@@ -412,6 +441,8 @@ function useTaskDetailRouteFetch(args: {
     navigationContext,
     hydrationEpochsAtRequestStartRef,
   } = args;
+  const [revision, setRevision] = useState(0);
+  const retry = useCallback(() => setRevision((value) => value + 1), []);
   useEffect(() => {
     const previous = previousLoadedRouteRef.current;
     const activeWorkspaceId = store.getState().workspaces.activeId;
@@ -440,9 +471,13 @@ function useTaskDetailRouteFetch(args: {
       store.getState(),
       taskId,
     );
-    readTaskNavigationIdentity(store, taskId, { context: navigationContext })
+    readTaskNavigationIdentity(store, taskId, {
+      context: navigationContext,
+      ...(revision ? { refresh: true } : {}),
+    })
       .then((identity) => {
         if (cancelled || !isTaskNavigationCurrent(store, navigationContext)) return;
+        assertRequestedSession(identity, taskId, sessionId);
         const shellState: TaskDetailRouteState = {
           routeKey,
           status: "loaded",
@@ -458,14 +493,12 @@ function useTaskDetailRouteFetch(args: {
         );
       })
       .catch((error) => {
-        if (!cancelled && isTaskNavigationCurrent(store, navigationContext)) {
-          if (!(error instanceof Error && error.name === "AbortError")) {
-            console.warn(
-              "Could not load /t/:taskId route data; task page will fall back to client fetches:",
-              error instanceof Error ? error.message : String(error),
-            );
-            setRouteState({ routeKey, status: "error", data: null });
-          }
+        if (
+          !cancelled &&
+          isTaskNavigationCurrent(store, navigationContext) &&
+          !(error instanceof Error && error.name === "AbortError")
+        ) {
+          setRouteState(taskRouteReadError(routeKey, error));
         }
       });
     return () => {
@@ -481,7 +514,23 @@ function useTaskDetailRouteFetch(args: {
     setRouteState,
     store,
     navigationContext,
+    revision,
   ]);
+  return retry;
+}
+
+function taskRouteReadError(routeKey: string, error: unknown): TaskDetailRouteState {
+  console.warn(
+    "Could not load /t/:taskId route data:",
+    error instanceof Error ? error.message : String(error),
+  );
+  return {
+    routeKey,
+    status: "error",
+    data: null,
+    temporary: isTemporaryTaskNavigationError(error),
+    sessionAdmission: error instanceof TaskSessionAdmissionError ? error.reason : undefined,
+  };
 }
 
 function TaskRouteLoading({

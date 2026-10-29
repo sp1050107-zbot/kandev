@@ -84,16 +84,6 @@ function buildCollapsibleItems(props: DesktopToolbarProps): ToolbarItemConfig[] 
   if (props.hideAgentControls) return [];
   return [
     {
-      id: "mcp",
-      section: "left",
-      render: () => (
-        <McpIndicator
-          mcpServers={props.mcpServers}
-          attachmentHistory={props.mcpAttachmentHistory}
-        />
-      ),
-    },
-    {
       id: "mode",
       section: "left",
       render: () => <ModeSelector sessionId={props.sessionId} />,
@@ -140,6 +130,7 @@ function DesktopRightSection(props: {
   showCollapsed: boolean;
   rightItems: ToolbarItemConfig[];
   sessionId: string | null;
+  detailActive: boolean;
   taskId: string | null;
   taskTitle?: string;
   hideAgentControls: boolean;
@@ -163,7 +154,7 @@ function DesktopRightSection(props: {
       {!props.showCollapsed && (
         <CollapsibleItems items={props.rightItems} testIdPrefix="toolbar-item-" />
       )}
-      <TokenUsageDisplay sessionId={props.sessionId} />
+      <TokenUsageDisplay sessionId={props.sessionId} detailActive={props.detailActive} />
       {props.planModeEnabled && !props.isAgentBusy && props.onImplementPlan && (
         <ImplementPlanButton
           onClick={props.onImplementPlan}
@@ -226,6 +217,15 @@ export function DesktopChatInputToolbar(props: DesktopToolbarProps) {
       )}
     >
       <div className="flex items-center gap-0.5 shrink-0">
+        {!props.hideAgentControls && (
+          <div data-testid="toolbar-item-mcp">
+            <McpIndicator
+              mcpServers={props.mcpServers}
+              attachmentHistory={props.mcpAttachmentHistory}
+              selection={props.mcpSelection}
+            />
+          </div>
+        )}
         {!props.hidePlanMode && (
           <PlanToggleButton
             planModeEnabled={props.planModeEnabled}
@@ -271,6 +271,7 @@ export function DesktopChatInputToolbar(props: DesktopToolbarProps) {
         showCollapsed={showCollapsed}
         rightItems={rightItems}
         sessionId={props.sessionId}
+        detailActive={props.detailActive ?? true}
         taskId={props.taskId}
         taskTitle={props.taskTitle}
         hideAgentControls={props.hideAgentControls}

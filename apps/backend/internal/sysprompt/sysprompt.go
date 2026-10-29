@@ -231,7 +231,7 @@ func KandevContext() string {
 	})
 }
 
-const userQuestionSection = `- ask_user_question_kandev: Ask the user 1-4 related questions and wait for all answers. Use this whenever you need user input to proceed. Treat this call as a hard user-input barrier: do not call another tool, do not continue working, and do not provide a final response until the tool returns completed user answers or a structured rejection. If the tool reports a validation error before creating a question, correct the request and retry. If an accepted question returns without completed answers or a structured rejection, end your turn immediately. This includes a timeout, disconnect, or pending wait. For an incomplete result, do not infer an answer or continue the task.
+const userQuestionSection = `- ask_user_question_kandev: Ask the user 1-4 related questions and wait for all answers. Keep shared context to 1-3 short sentences or brief bullets (about 100 words or fewer); put full reports, logs, and repeated conversation outside this call, before it. Keep each question and its options self-contained. Treat this as a hard user-input barrier: do no more work, make no tool calls, or send a final response until completed answers or structured rejection. On validation error before question creation, correct and retry. If an accepted call returns incomplete (including timeout, disconnect, or pending wait), end the turn without inferring an answer or continuing work.
 `
 
 const parentQuestionSection = `- ask_parent_question_kandev: Ask the direct parent task one or more critical questions. Use this only when you cannot continue safely without a parent decision. The question is sent to the parent task, and this call MUST end your turn; do not use an operator-question tool.
@@ -245,7 +245,7 @@ const canvasGuidanceSection = `CANVAS AUTHORING:
 Use these tools only when the user explicitly asks for a Kandev canvas: create_canvas_kandev, read_canvas_authoring_skill_kandev, and publish_canvas_kandev. Create it in Kandev before writing app files. Read the skill once, edit only in its returned source directory, then publish through MCP. Report publication status, including failures. Local files or a successful build do not publish a canvas.
 `
 
-const richOutputSection = `- show_rich_output_kandev: For a chart, graph, plot, file preview, KPI, or metrics request with data, call this now. Do not implement it as ASCII, SVG, HTML, or another app. Otherwise use prose or a small Markdown table. Get the schema and examples from tool discovery. Paths are workspace-relative; Kandev owns layout, axes, legends, and tooltips. Label series with units.
+const richOutputSection = `- show_rich_output_kandev: For structured comparisons, recorded checks, charts/graphs/plots, file previews or KPI/metrics with data, call now. Table compares; StatusList checks; Callout notes. Use version=2,catalog_version=1,spec; discover schema/examples. Workspace-relative paths. Kandev owns layout/styling. Label series with units. No ASCII/SVG/HTML/separate app. Otherwise prose or small Markdown tables.
 `
 
 // stepCompleteSection is the description + instruction block for the

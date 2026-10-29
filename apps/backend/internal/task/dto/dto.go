@@ -1,7 +1,9 @@
 package dto
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"time"
 
@@ -143,20 +145,22 @@ type ShellOutputSnapshotResponse struct {
 }
 
 type ExecutorDTO struct {
-	ID        string                   `json:"id"`
-	Name      string                   `json:"name"`
-	Type      models.ExecutorType      `json:"type"`
-	Status    models.ExecutorStatus    `json:"status"`
-	IsSystem  bool                     `json:"is_system"`
-	Resumable bool                     `json:"resumable"`
-	Config    map[string]string        `json:"config,omitempty"`
-	Profiles  []ExecutorProfileDTO     `json:"profiles,omitempty"`
-	Provider  *models.ExecutorProvider `json:"provider,omitempty"`
-	CreatedAt time.Time                `json:"created_at"`
-	UpdatedAt time.Time                `json:"updated_at"`
+	OwnerUserID string                   `json:"owner_user_id"`
+	ID          string                   `json:"id"`
+	Name        string                   `json:"name"`
+	Type        models.ExecutorType      `json:"type"`
+	Status      models.ExecutorStatus    `json:"status"`
+	IsSystem    bool                     `json:"is_system"`
+	Resumable   bool                     `json:"resumable"`
+	Config      map[string]string        `json:"config,omitempty"`
+	Profiles    []ExecutorProfileDTO     `json:"profiles,omitempty"`
+	Provider    *models.ExecutorProvider `json:"provider,omitempty"`
+	CreatedAt   time.Time                `json:"created_at"`
+	UpdatedAt   time.Time                `json:"updated_at"`
 }
 
 type ExecutorProfileDTO struct {
+	OwnerUserID   string                   `json:"owner_user_id"`
 	ID            string                   `json:"id"`
 	ExecutorID    string                   `json:"executor_id"`
 	ExecutorType  string                   `json:"executor_type,omitempty"`
@@ -194,6 +198,7 @@ type EnvironmentDTO struct {
 type TaskDTO struct {
 	ID                          string                         `json:"id"`
 	WorkspaceID                 string                         `json:"workspace_id"`
+	InitialWorkspaceLayout      string                         `json:"initial_workspace_layout,omitempty"`
 	WorkflowID                  string                         `json:"workflow_id"`
 	WorkflowStepID              string                         `json:"workflow_step_id"`
 	WorkflowAgentOverrides      *models.WorkflowAgentOverrides `json:"workflow_agent_overrides,omitempty"`
@@ -291,6 +296,9 @@ type TaskDTO struct {
 	// idempotency (docs/specs/tasks/requirements/external-id-idempotency.md). Omitted
 	// when the task holds none.
 	ExternalID string `json:"external_id,omitempty"`
+	// QuickChatCreationID is the exact retry token carried by lifecycle
+	// projections for an internally keyed Quick Chat creation.
+	QuickChatCreationID string `json:"quick_chat_creation_id,omitempty"`
 	// IsFromOffice is the authoritative "this task is owned by office"
 	// flag. Computed by the task repo at read time as
 	// (project_id != '' OR workflow_id == workspace.office_workflow_id).
@@ -335,6 +343,7 @@ type TaskRepositoryDTO struct {
 	ID                            string                            `json:"id"`
 	TaskID                        string                            `json:"task_id"`
 	RepositoryID                  string                            `json:"repository_id"`
+	WorkspaceRelativePath         string                            `json:"workspace_relative_path,omitempty"`
 	BaseBranch                    string                            `json:"base_branch"`
 	CheckoutBranch                string                            `json:"checkout_branch,omitempty"`
 	BranchPolicyID                string                            `json:"branch_policy_id,omitempty"`
@@ -350,13 +359,14 @@ type TaskRepositoryDTO struct {
 
 // TaskWorkspaceFolderDTO is the API projection of a durable non-Git source.
 type TaskWorkspaceFolderDTO struct {
-	ID          string    `json:"id"`
-	TaskID      string    `json:"task_id"`
-	LocalPath   string    `json:"local_path"`
-	DisplayName string    `json:"display_name"`
-	Position    int       `json:"position"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID                    string    `json:"id"`
+	TaskID                string    `json:"task_id"`
+	LocalPath             string    `json:"local_path"`
+	DisplayName           string    `json:"display_name"`
+	WorkspaceRelativePath string    `json:"workspace_relative_path,omitempty"`
+	Position              int       `json:"position"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
 }
 
 // WorkspaceRecoveryDTO contains only the path-free public progress projection.
@@ -385,6 +395,19 @@ type WorkspaceRecoveryDTO struct {
 	UpdatedAt           time.Time  `json:"updated_at"`
 	EndedAt             *time.Time `json:"ended_at,omitempty"`
 	ReasonCode          string     `json:"reason_code,omitempty"`
+}
+
+// SessionRecoveryBlockDTO contains the path-free identity and cause needed to
+// present an open operator recovery block.
+type SessionRecoveryBlockDTO struct {
+	ID                   string    `json:"id"`
+	IncarnationID        string    `json:"incarnation_id"`
+	ExpectedGeneration   int64     `json:"expected_generation"`
+	Reason               string    `json:"reason"`
+	ConsumerReference    string    `json:"consumer_reference,omitempty"`
+	DeliverySubmissionID string    `json:"delivery_submission_id,omitempty"`
+	DeliveryStreamID     string    `json:"delivery_stream_id,omitempty"`
+	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 type TaskSessionDTO struct {
@@ -434,6 +457,9 @@ type TaskSessionDTO struct {
 	ReviewStatus      models.ReviewStatus   `json:"review_status,omitempty"`
 	TaskEnvironmentID string                `json:"task_environment_id,omitempty"`
 	WorkspaceRecovery *WorkspaceRecoveryDTO `json:"workspace_recovery"`
+	// SessionRecoveryBlocks is always serialized so a resolved block clears a
+	// prior client projection.
+	SessionRecoveryBlocks []SessionRecoveryBlockDTO `json:"session_recovery_blocks"`
 	// ForegroundActivity mirrors the in-memory fine-grained busy substate so a
 	// fresh page-load / second tab sees live background work without waiting for
 	// a WS flip (ADR-0049). Generating is emitted only for RUNNING sessions;
@@ -448,6 +474,9 @@ type TaskSessionDTO struct {
 	// generation that produced CancellationPending. It is always serialized so
 	// clients can reject delayed snapshots from older generations.
 	CancellationRevision uint64 `json:"cancellation_revision"`
+	// RuntimeStorageHealth mirrors the lifecycle-owned advisory capacity
+	// projection. It is never persisted and stays absent for older sources.
+	RuntimeStorageHealth *RuntimeStorageHealthDTO `json:"runtime_storage_health,omitempty"`
 	// SupportsSteering is true when a send right now would be delivered into the
 	// still-generating turn (mid-turn steering) rather than blocked/queued.
 	// Derived live at serialization from the connected agent's negotiated
@@ -496,6 +525,61 @@ func EnrichWorkspaceRecovery(
 		return
 	}
 	session.WorkspaceRecovery = WorkspaceRecoveryFromOperation(operation, runnerLive)
+}
+
+// SessionRecoveryBlockProjectionReader provides the current generation and its
+// open recovery causes to the session serialization boundary.
+type SessionRecoveryBlockProjectionReader interface {
+	GetCurrentHarnessSessionGeneration(context.Context, string, string) (*models.HarnessSessionGeneration, error)
+	ListOpenSessionRecoveryBlocks(context.Context, string, string, int64) ([]*models.SessionRecoveryBlock, error)
+}
+
+// EnrichSessionRecoveryBlocks projects blocks only for the current persisted
+// native-session generation. A missing generation cannot inherit an old one.
+func EnrichSessionRecoveryBlocks(
+	ctx context.Context,
+	result *TaskSessionDTO,
+	session *models.TaskSession,
+	reader SessionRecoveryBlockProjectionReader,
+) error {
+	if result == nil {
+		return nil
+	}
+	result.SessionRecoveryBlocks = []SessionRecoveryBlockDTO{}
+	if session == nil || reader == nil {
+		return nil
+	}
+	incarnationID := session.QueueIncarnationID
+	if incarnationID == "" {
+		incarnationID = session.ID
+	}
+	generation, err := reader.GetCurrentHarnessSessionGeneration(ctx, session.ID, incarnationID)
+	if errors.Is(err, models.ErrTaskSessionNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if generation == nil || generation.Generation < 1 {
+		return nil
+	}
+	blocks, err := reader.ListOpenSessionRecoveryBlocks(ctx, session.ID, incarnationID, generation.Generation)
+	if err != nil {
+		return err
+	}
+	for _, block := range blocks {
+		if block == nil || block.State != models.RecoveryBlockOpen {
+			continue
+		}
+		result.SessionRecoveryBlocks = append(result.SessionRecoveryBlocks, SessionRecoveryBlockDTO{
+			ID: block.ID, IncarnationID: block.IncarnationID,
+			ExpectedGeneration: block.ExpectedGeneration, Reason: block.Reason,
+			ConsumerReference:    block.ConsumerReference,
+			DeliverySubmissionID: block.DeliverySubmissionID,
+			DeliveryStreamID:     block.DeliveryStreamID, UpdatedAt: block.UpdatedAt,
+		})
+	}
+	return nil
 }
 
 // WorkspaceRecoveryFromOperation builds the public path-free progress shape.
@@ -575,6 +659,9 @@ type TaskSessionSummaryDTO struct {
 	// CancellationRevision identifies the process-local cancellation transition
 	// generation represented by CancellationPending.
 	CancellationRevision uint64 `json:"cancellation_revision"`
+	// RuntimeStorageHealth mirrors the lifecycle-owned advisory capacity
+	// projection. It is never persisted and stays absent for older sources.
+	RuntimeStorageHealth *RuntimeStorageHealthDTO `json:"runtime_storage_health,omitempty"`
 	// SupportsSteering mirrors TaskSessionDTO.SupportsSteering for list endpoints.
 	SupportsSteering bool `json:"supports_steering,omitempty"`
 	// PendingAction is the compact per-session projection used when the
@@ -630,10 +717,17 @@ type WorkflowSnapshotDTO struct {
 }
 
 type ListMessagesResponse struct {
-	Messages []*v1.Message `json:"messages"`
-	Total    int           `json:"total"`
-	HasMore  bool          `json:"has_more"`
-	Cursor   string        `json:"cursor"`
+	Messages     []*v1.Message           `json:"messages"`
+	Total        int                     `json:"total"`
+	HasMore      bool                    `json:"has_more"`
+	Cursor       string                  `json:"cursor"`
+	Turns        []TurnDTO               `json:"turns,omitempty"`
+	TurnCoverage *MessageTurnCoverageDTO `json:"turn_coverage,omitempty"`
+}
+
+type MessageTurnCoverageDTO struct {
+	MessageIDs   []string `json:"message_ids"`
+	ActiveTurnID *string  `json:"active_turn_id"`
 }
 
 // MessageSearchHit is a lightweight match returned by a session message search.
@@ -921,22 +1015,24 @@ func FromRepositoryScript(script *models.RepositoryScript) RepositoryScriptDTO {
 
 func FromExecutor(executor *models.Executor) ExecutorDTO {
 	return ExecutorDTO{
-		ID:        executor.ID,
-		Name:      executor.Name,
-		Type:      executor.Type,
-		Status:    executor.Status,
-		IsSystem:  executor.IsSystem,
-		Resumable: executor.Resumable,
-		Config:    executor.Config,
-		Provider:  executor.Provider,
-		CreatedAt: executor.CreatedAt,
-		UpdatedAt: executor.UpdatedAt,
+		OwnerUserID: executor.OwnerUserID,
+		ID:          executor.ID,
+		Name:        executor.Name,
+		Type:        executor.Type,
+		Status:      executor.Status,
+		IsSystem:    executor.IsSystem,
+		Resumable:   executor.Resumable,
+		Config:      executor.Config,
+		Provider:    executor.Provider,
+		CreatedAt:   executor.CreatedAt,
+		UpdatedAt:   executor.UpdatedAt,
 	}
 }
 
 func FromExecutorProfile(profile *models.ExecutorProfile) ExecutorProfileDTO {
 	config, secretFields := models.RedactExecutorProfileConfig(profile.Config)
 	return ExecutorProfileDTO{
+		OwnerUserID:   profile.OwnerUserID,
 		ID:            profile.ID,
 		ExecutorID:    profile.ExecutorID,
 		Name:          profile.Name,
@@ -1040,6 +1136,7 @@ func FromTaskWithSessionInfo(
 			ID:                            repo.ID,
 			TaskID:                        repo.TaskID,
 			RepositoryID:                  repo.RepositoryID,
+			WorkspaceRelativePath:         repo.WorkspaceRelativePath,
 			BaseBranch:                    repo.BaseBranch,
 			CheckoutBranch:                repo.CheckoutBranch,
 			BranchPolicyID:                repo.BranchPolicyID,
@@ -1056,19 +1153,21 @@ func FromTaskWithSessionInfo(
 	var workspaceFolders []TaskWorkspaceFolderDTO
 	for _, folder := range task.WorkspaceFolders {
 		workspaceFolders = append(workspaceFolders, TaskWorkspaceFolderDTO{
-			ID:          folder.ID,
-			TaskID:      folder.TaskID,
-			LocalPath:   folder.LocalPath,
-			DisplayName: folder.DisplayName,
-			Position:    folder.Position,
-			CreatedAt:   folder.CreatedAt,
-			UpdatedAt:   folder.UpdatedAt,
+			ID:                    folder.ID,
+			TaskID:                folder.TaskID,
+			LocalPath:             folder.LocalPath,
+			DisplayName:           folder.DisplayName,
+			WorkspaceRelativePath: folder.WorkspaceRelativePath,
+			Position:              folder.Position,
+			CreatedAt:             folder.CreatedAt,
+			UpdatedAt:             folder.UpdatedAt,
 		})
 	}
 
 	return TaskDTO{
 		ID:                          task.ID,
 		WorkspaceID:                 task.WorkspaceID,
+		InitialWorkspaceLayout:      task.InitialWorkspaceLayout,
 		WorkflowID:                  task.WorkflowID,
 		WorkflowStepID:              task.WorkflowStepID,
 		WorkflowAgentOverrides:      workflowAgentOverrides,
@@ -1120,6 +1219,7 @@ func FromTaskWithSessionInfo(
 		Labels:                 task.Labels,
 		Identifier:             task.Identifier,
 		ExternalID:             task.ExternalID,
+		QuickChatCreationID:    service.QuickChatCreationIDFromExternalID(task.ExternalID),
 		IsFromOffice:           task.IsFromOffice,
 	}
 }
@@ -1166,6 +1266,12 @@ func FromTaskSessionSummary(session *models.TaskSession) TaskSessionSummaryDTO {
 	return result
 }
 
+// FromTaskSessionSummaryObservation converts a bounded repository projection
+// to the existing compact session DTO without widening it with rich fields.
+func FromTaskSessionSummaryObservation(observation *models.TaskSessionSummaryObservation) TaskSessionSummaryDTO {
+	return FromTaskSessionSummary(observation.ToTaskSession())
+}
+
 func FromTaskSession(session *models.TaskSession) TaskSessionDTO {
 	result := TaskSessionDTO{
 		ID:                   session.ID,
@@ -1197,15 +1303,16 @@ func FromTaskSession(session *models.TaskSession) TaskSessionDTO {
 		CompletedAt:          session.CompletedAt,
 		UpdatedAt:            session.UpdatedAt,
 		// Workflow fields
-		IsPrimary:         session.IsPrimary,
-		IsPassthrough:     session.IsPassthrough,
-		ReviewStatus:      session.ReviewStatus,
-		TaskEnvironmentID: session.TaskEnvironmentID,
-		LastReadMessageID: session.LastReadMessageID,
-		CostSubcents:      session.CostSubcents,
-		TokensIn:          session.TokensIn,
-		TokensCachedIn:    session.TokensCachedIn,
-		TokensOut:         session.TokensOut,
+		IsPrimary:             session.IsPrimary,
+		IsPassthrough:         session.IsPassthrough,
+		ReviewStatus:          session.ReviewStatus,
+		TaskEnvironmentID:     session.TaskEnvironmentID,
+		SessionRecoveryBlocks: []SessionRecoveryBlockDTO{},
+		LastReadMessageID:     session.LastReadMessageID,
+		CostSubcents:          session.CostSubcents,
+		TokensIn:              session.TokensIn,
+		TokensCachedIn:        session.TokensCachedIn,
+		TokensOut:             session.TokensOut,
 	}
 	if worktrees := session.WorktreesAPI(); len(worktrees) > 0 {
 		result.WorktreeID = session.Worktrees[0].WorktreeID
@@ -1344,6 +1451,8 @@ type StepEventsDTO struct {
 	OnHeartbeat         []StepActionDTO `json:"on_heartbeat,omitempty"`
 	OnBudgetAlert       []StepActionDTO `json:"on_budget_alert,omitempty"`
 	OnAgentError        []StepActionDTO `json:"on_agent_error,omitempty"`
+	OnPRMerged          []StepActionDTO `json:"on_pr_merged,omitempty"`
+	OnPRClosed          []StepActionDTO `json:"on_pr_closed,omitempty"`
 }
 
 // StepActionDTO represents a step action for API responses
@@ -1594,13 +1703,22 @@ func FromTurn(turn *models.Turn) TurnDTO {
 		completedAt = &formatted
 	}
 
+	metadata := make(map[string]interface{}, len(turn.Metadata))
+	for key, value := range turn.Metadata {
+		if key != models.TurnMetaKeyTurnChangeActorUserID && key != models.TurnMetaKeyTurnChangeSyntheticActor {
+			metadata[key] = value
+		}
+	}
+	if len(metadata) == 0 {
+		metadata = nil
+	}
 	return TurnDTO{
 		ID:          turn.ID,
 		SessionID:   turn.TaskSessionID,
 		TaskID:      turn.TaskID,
 		StartedAt:   turn.StartedAt.UTC().Format(turnTimestampLayout),
 		CompletedAt: completedAt,
-		Metadata:    turn.Metadata,
+		Metadata:    metadata,
 		CreatedAt:   turn.CreatedAt.UTC().Format(turnTimestampLayout),
 		UpdatedAt:   turn.UpdatedAt.UTC().Format(turnTimestampLayout),
 	}

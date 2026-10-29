@@ -25,8 +25,8 @@ function buildPortProxyUrl(sessionId: string, port: number): string {
 
 function buildTunnelUrl(tunnelPort: number): string {
   const backendUrl = getBackendConfig().apiBaseUrl;
-  const { protocol, hostname } = new URL(backendUrl);
-  return `${protocol}//${hostname}:${tunnelPort}/`;
+  const { hostname } = new URL(backendUrl);
+  return `http://${hostname}:${tunnelPort}/`;
 }
 
 export function InfoTip({ text }: { text: string }) {
@@ -340,9 +340,11 @@ export function PortListSection({
           size="default"
           variant="ghost"
           data-testid="port-forward-refresh"
-          className="cursor-pointer gap-1 text-xs"
-          onClick={onRefresh}
-          disabled={loading}
+          className="cursor-pointer gap-1 text-xs aria-disabled:cursor-wait aria-disabled:opacity-45"
+          onClick={() => {
+            if (!loading) onRefresh();
+          }}
+          aria-disabled={loading}
         >
           {loading ? (
             <IconLoader2 className="h-3.5 w-3.5 animate-spin" />

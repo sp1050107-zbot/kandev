@@ -24,6 +24,7 @@ existing controls, recovery actions, and persistence.
 | REQ-PLATFORM-DURABLE-AGENT-DELIVERY-006, criteria .7 and .10 | Workspace-only access |
 | REQ-PLATFORM-DURABLE-AGENT-DELIVERY-006, criteria .8, .9, .11 and .12 | Manual resume |
 | REQ-PLATFORM-DURABLE-AGENT-DELIVERY-006, criteria .1 through .6 | Existing delivery and continuity designs |
+| REQ-PLATFORM-DURABLE-AGENT-DELIVERY-006, criteria .25 and .26 | Bounded projection wait |
 
 ## Workspace-only access
 
@@ -32,6 +33,14 @@ Keep task/session binding, archive, execution permissions, and workspace ownersh
 Reject a nonempty prompt on workspace-only requests. Workspace restoration does not resolve
 a prompt recovery block, including when `RecoveryAction` is supplied. No ACP initialize, new,
 load, resume, prompt, or queue drain may occur. Quick Chat requires no Git repository.
+
+Workspace inspection must preserve durable restart recovery ownership. An existing owned
+workspace execution remains accessible. A generic prompt block alone may permit cold
+workspace creation only when fresh evidence contains no saved execution, delivery binding,
+or pending recovery source or candidate. Recheck this at creation and registration.
+Active or malformed delivery recovery evidence blocks competing allocation, even for an
+explicit workspace request. Wait for exact-owner reconnection or restoration instead of
+replacing its row. See [durable reattachment](durable-agent-reattachment.md).
 
 ## Manual resume
 
@@ -48,6 +57,11 @@ feedback continue to work. Use the existing 60-second manual resume timeout. Do 
 Automatic open/focus paths still use `session.launch` with their existing activation source.
 They cannot acquire explicit recovery authorization. Do not pass a recovery action directly
 on an ordinary launch request to bypass the recovery coordinator.
+
+Explicit native recovery must await the current agent-start or reattachment result before
+acknowledging uncertain delivery or resolving its database block. An initialized flag retained
+from recovered inventory is not proof that the current authenticated reattachment succeeded.
+A current-start failure must leave the block and historical unknown submission intact.
 
 `RecoverSessionWithOptions` retains existing runtime control, workspace recovery preflight,
 configuration restoration, native-token preservation, Office dispatcher handoff, and
@@ -71,10 +85,26 @@ after matching every unresolved SQL row to its peer record by ID, session, incar
 generation, and payload hash. Missing or conflicting evidence prevents every retirement write.
 It then re-reads both stores and requires retained retirement for each unresolved SQL row
 before clearing the database block. Already-retired matching records make this idempotent.
+If background recovery resolves the same block while explicit Resume gathers proof,
+SQL verification revalidates the complete proof under the delivery lock. It accepts
+the completed resolution only for the same session, incarnation, generation, and
+authorized `resume` action, with no remaining open session recovery block. It does
+not update recovery metadata or timestamps again. Stale proof, a different action,
+or a new incident remains blocked.
+The resolver's change flag remains false for repeated resolution. Explicit Resume
+uses the separate verification result to report completed recovery as success.
 The eligible journal records belong to the current incarnation at or before the current generation.
+Historical blocks may predate recovery-notice metadata. After the same authenticated retirement
+check, SQL resolution accepts that case only when persisted ACP native identity matches the
+current harness generation, the block uses that incarnation and generation, and its exact
+submission remains interrupted-unknown in that session and generation. A stream identity is
+required. Missing native metadata, a superseding generation, or mismatched submission keeps
+the block open. Resolution preserves metadata and historical uncertainty rather than creating
+a recovery snapshot whose original process identity is unavailable.
 The process owner serializes retirement against prompt dispatch and checks the trusted owner. Retirement preserves unknown
 state and payload and makes duplicate admission or dispatch of that ID fail. Existing newer
-generation retirement still cancels other superseded work. A refreshed capability must be clear
+generation retirement records unfinished superseded work as interrupted-unknown and retains
+its payload; previously terminal outcomes remain unchanged. A refreshed capability must be clear
 before SQL block resolution and parked queue release. Legacy peers retain ordinary compatibility;
 authentication and storage errors fail closed.
 
@@ -83,11 +113,65 @@ full peer records retain matching retirement, uncertain state, session/incarnati
 and payload hash. Missing or conflicting proof remains blocked. No recovery summary field,
 new endpoint, migration, native conversation replacement, or generation rotation is needed.
 
+## Bounded projection wait
+
+The [silent prompt work package](../../../plans/silent-prompt-recovery/plan.md)
+records implementation and verification. `nativeResumeProofCursor` returns the
+distinct `errNativeResumeProjectionLag` sentinel when received and projected
+sequences differ. It wraps `ErrDurableAdoptionBlocked` for compatibility.
+The retry loop owned by `GetNativeResumeDeliveryEvidence` must match
+`errNativeResumeProjectionLag` with `errors.Is` before handling
+`ErrDurableAdoptionBlocked`. Compatibility handling must not short-circuit the
+bounded projection wait. Never classify errors by message text.
+
+`GetNativeResumeDeliveryEvidence` owns the wait because it owns the complete
+proof. Retry only verified projection lag or monotonic same-owner stream progress
+after authentication, cursor coverage, submission retirement, and identity
+validation. Either result starts the bounded wait, including on the first proof
+attempt. Capture session, execution,
+incarnation, stream, native session, and harness generation from that proof
+attempt. Use a 10-second maximum and 200 ms polling, shortened by caller
+cancellation/deadline. Do not detach this wait from the recovery request.
+
+Poll the cursor through the existing repository and verify current execution
+ownership. No event-bus, projection, cancellation, or stream lock may span the
+wait. A notification primitive may replace polling if it already has the same
+bounded and cancellation-safe behavior. Do not add a general retry service.
+
+When the cursor catches up, discard the partial proof and rerun the full
+existing authenticated status, SQL/journal inventory, retirement, cursor and
+final-status checks. Revalidate captured identity before returning. One full
+proof with equal cursors and matching opening/closing authenticated status is
+sufficient; no additional quiet polling interval is required. If same-owner
+stream progress invalidates that proof, retry no sooner than the next 200 ms
+poll, using the original deadline. A stream that prevents a stable full proof
+throughout the budget times out and stays blocked. Changed identity,
+storage/authentication failure, unresolved live work, and conflicting evidence
+fail immediately. Never retry native initialization or send a prompt as part of
+this loop. Empty streams keep their current behavior.
+
+The existing transactional SQL resolver remains the final authority. Resolving
+one block cannot clear unrelated restrictions. Timeout returns the typed blocked
+result and preserves retired history and prior uncertainty for a later explicit
+attempt. Cancellation or a replacement execution prevents a late result from
+resolving the block. Existing concurrent recovery ownership prevents duplicate
+resolution and queue release.
+
+The browser retains its existing 60-second manual Resume timeout and busy
+controls on desktop and phone. No extra action or new layout is needed.
+Tests use a projection barrier and real journal/SQL state to prove one-request
+success, timeout, cancellation, owner change, same-owner progress, unavailable
+storage, no historical resend, and preservation of unrelated blocks. Continuously
+advancing status must time out on the original deadline without a tight retry
+loop. Unresolved journal work, even with a lagging cursor, must return blocked
+before starting a wait or scheduling a retry.
+
 ## Failure and compatibility
 
 Native-state loss remains an existing typed history-continuation failure, not an automatic
 fallback. Resume failure leaves the block open. Late replies must not update another active
-session. Workspace restoration remains usable while the original delivery block is open.
+session. Workspace inspection through an owned execution remains usable while the original
+delivery block is open; cold allocation follows the ownership checks above.
 Task chat and Quick Chat share the manual hook. Desktop and phone use existing controls and
 layouts; the read-only notice reuses the localized Resume label and shared recovery actions.
 
@@ -107,3 +191,20 @@ Follow-up verification includes the no-composer-owner read-only browser state on
 and phone, real bbolt acknowledgement, no replay and distinct new delivery, busy/foreign-owner
 rejection, failed journal acknowledgement retaining SQL blocks, journal reopen, and authenticated
 adoption of acknowledged unknown history.
+
+Canonical interrupted-prompt blocks with a submission ID and no structured runtime
+recovery record retain the existing explicit Resume action. They do not select
+Retry-only controls. A runtime recovery record or legacy uncertain-delivery error
+still selects state-only Retry. Restart restoration follows the automatic
+restore-only contract in the durable reattachment design.
+The browser tests prove the existing Resume target remains clickable on desktop
+and at a 320-pixel phone width, with a touch target of at least 44 pixels.
+
+An open delivery block keeps ordinary input disabled even without a coarse session
+error. Canonical interrupted work retains existing Resume; structured runtime
+recovery retains Retry. Terminal SQL settlement advances
+the session snapshot timestamp in the block-resolution transaction. The backend
+publishes the cleared block array even when no runtime recovery metadata exists.
+Explicit Resume publishes the same projection after resolving the saved block,
+before releasing parked queue work. A later queue failure does not hide a
+committed block resolution from the browser.

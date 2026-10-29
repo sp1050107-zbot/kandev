@@ -18,10 +18,11 @@ type sessionUpdater interface {
 // emitter wraps an ACP connection and session ID to provide
 // convenient methods for streaming agent updates.
 type emitter struct {
-	ctx        context.Context
-	conn       sessionUpdater
-	sid        acp.SessionId
-	mcpServers map[string]mcpServerDef
+	ctx                  context.Context
+	conn                 sessionUpdater
+	sid                  acp.SessionId
+	mcpServers           map[string]mcpServerDef
+	registerDetachedWork func(acp.SessionId, context.CancelFunc) func()
 }
 
 // callMCPTool invokes an MCP tool through the server definitions attached to
@@ -457,4 +458,17 @@ func (e *emitter) requestPermission(toolCallID acp.ToolCallId, title string, kin
 		return false
 	}
 	return resp.Outcome.Selected != nil && string(resp.Outcome.Selected.OptionId) == "allow"
+}
+
+// completeToolWithContent completes a tool call with both raw output and an
+// explicit rich content carrier. Use it to reproduce providers whose typed
+// result and duplicate content carriers carry independent display data.
+func (e *emitter) completeToolWithContent(id acp.ToolCallId, output any, text string) {
+	_ = e.conn.SessionUpdate(e.ctx, acp.SessionNotification{
+		SessionId: e.sid,
+		Update: acp.UpdateToolCall(id,
+			acp.WithUpdateStatus(acp.ToolCallStatusCompleted),
+			acp.WithUpdateRawOutput(output),
+			acp.WithUpdateContent([]acp.ToolCallContent{acp.ToolContent(acp.TextBlock(text))})),
+	})
 }

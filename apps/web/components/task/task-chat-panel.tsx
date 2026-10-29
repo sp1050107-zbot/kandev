@@ -22,6 +22,7 @@ import {
   type ChatSubmitResult,
 } from "@/components/task/chat/chat-input-container";
 import { MessageList } from "@/components/task/chat/message-list";
+import type { HistoricalTurnDiffTarget } from "@/lib/state/diff-target-types";
 import {
   type MessageListHandle,
   type LastPromptEdge,
@@ -772,6 +773,7 @@ type TaskChatPanelProps = {
   onSend?: (payload: ChatSubmitPayload) => ChatSubmitResult;
   sessionId?: string | null;
   taskId?: string | null;
+  workspaceId?: string | null;
   /**
    * Task this panel belongs to, independent of whether it has a session yet.
    * Only the status row uses it, so a task with no session still shows its
@@ -780,6 +782,7 @@ type TaskChatPanelProps = {
    */
   statusTaskId?: string | null;
   onOpenFile?: (path: string, repo?: string) => void;
+  onOpenHistoricalDiff?: (target: HistoricalTurnDiffTarget) => void;
   showRequestChangesTooltip?: boolean;
   onRequestChangesTooltipDismiss?: () => void;
   /** Callback to open a file at a specific line (for comment clicks) */
@@ -804,6 +807,8 @@ type TaskChatPanelProps = {
    * already implies visibility for them.
    */
   isVisible?: boolean;
+  /** Whether this panel may own rich session detail reads and subscriptions. */
+  detailActive?: boolean;
   panelId?: string | null;
   /** Legacy message-only target for non-Dockview hosts. */
   pendingScrollToMessageId?: string | null;
@@ -1198,6 +1203,16 @@ export function useScrollTargetConsumption({
   return jumpLoading;
 }
 
+function usePanelLaunchStatusSummary(statusTaskId: string | null, taskIdHint: string | null) {
+  const launchErrorContext = useTaskLaunchErrorContext();
+  const summaryTaskId = statusTaskId ?? taskIdHint ?? launchErrorContext?.taskId ?? null;
+  const launchStatusSummary = useTaskStatusSummary(
+    summaryTaskId,
+    launchErrorContext?.taskId === summaryTaskId ? launchErrorContext.statusSummary : undefined,
+  );
+  return { summaryTaskId, launchStatusSummary };
+}
+
 // eslint-disable-next-line complexity, max-lines-per-function -- composes many sub-panels; each concern already factored into its own hook
 export const TaskChatPanel = memo(function TaskChatPanel({
   onSend,
@@ -1205,12 +1220,14 @@ export const TaskChatPanel = memo(function TaskChatPanel({
   taskId: taskIdHint = null,
   statusTaskId = null,
   onOpenFile,
+  onOpenHistoricalDiff,
   showRequestChangesTooltip = false,
   onRequestChangesTooltipDismiss,
   onOpenFileAtLine,
   hideSessionsDropdown,
   embedded = false,
   isVisible = true,
+  detailActive = true,
   panelId = null,
   pendingScrollToMessageId = null,
   pendingScrollTarget,
@@ -1220,17 +1237,16 @@ export const TaskChatPanel = memo(function TaskChatPanel({
 }: TaskChatPanelProps) {
   const isArchived = useIsTaskArchived();
   const chatInputRef = useRef<ChatInputContainerHandle>(null);
-  const launchErrorContext = useTaskLaunchErrorContext();
-  const summaryTaskId = statusTaskId ?? taskIdHint ?? launchErrorContext?.taskId ?? null;
-  const launchStatusSummary = useTaskStatusSummary(
-    summaryTaskId,
-    launchErrorContext?.taskId === summaryTaskId ? launchErrorContext.statusSummary : undefined,
+  const { summaryTaskId, launchStatusSummary } = usePanelLaunchStatusSummary(
+    statusTaskId,
+    taskIdHint,
   );
   const { t } = useTranslation();
   useSettingsData(true);
   const panelState = useChatPanelState({
     sessionId,
     taskId: taskIdHint,
+    detailActive,
     disableWorkbenchEffects: embedded,
     onOpenFile,
     onOpenFileAtLine,
@@ -1271,6 +1287,13 @@ export const TaskChatPanel = memo(function TaskChatPanel({
   const { clarificationKey, handleClarificationResolved } = useClarificationKey(agentMessageCount);
 
   const panelRef = useRef<HTMLDivElement>(null);
+  const launchQueueStatusRef = useRef<HTMLDivElement>(null);
+  const wipQueueStatusRef = useRef<HTMLDivElement>(null);
+  const chatFooterRef = useRef<HTMLDivElement>(null);
+  const clarificationReservations = useMemo(
+    () => [launchQueueStatusRef, wipQueueStatusRef, chatFooterRef],
+    [],
+  );
   const messageListRef = useRef<MessageListHandle>(null);
   const dividerBeforeItemKey = useUnreadDividerBeforeItemKey(
     resolvedSessionId,
@@ -1354,7 +1377,7 @@ export const TaskChatPanel = memo(function TaskChatPanel({
     settlementMode: "identity",
   });
   const isJumpLoading = isDockviewJumpLoading || isPendingJumpLoading || isLocalJumpLoading;
-  const projection = useSessionPrompts(resolvedSessionId, { firstLoadOnly: true });
+  const projection = useSessionPrompts(resolvedSessionId, { firstLoadOnly: true, detailActive });
   const observed = useAppStore((state) =>
     resolvedSessionId ? state.messagePrompts.observedBySession?.[resolvedSessionId] : undefined,
   );
@@ -1515,6 +1538,7 @@ export const TaskChatPanel = memo(function TaskChatPanel({
   return (
     <SessionRecoveryProvider
       messagesLoading={messagesLoading}
+      onDeliveryReconciled={retryHistory}
       session={session}
       messages={[...allMessages, ...footerActionMessages]}
       taskId={taskId}
@@ -1525,12 +1549,19 @@ export const TaskChatPanel = memo(function TaskChatPanel({
         data-testid="session-chat"
         data-panel-kind="session"
         data-session-id={resolvedSessionId ?? undefined}
+        data-detail-active={detailActive ? "true" : "false"}
         tabIndex={-1}
         onMouseDown={handlePanelMouseDown}
         className="outline-none"
       >
-        {!hideLaunchQueueStatus && <LaunchQueueStatus queue={launchStatusSummary?.launch_queue} />}
-        {!hideWipQueueStatus && <WipQueueStatus taskId={summaryTaskId} />}
+        <div ref={launchQueueStatusRef} className="shrink-0">
+          {!hideLaunchQueueStatus && (
+            <LaunchQueueStatus queue={launchStatusSummary?.launch_queue} />
+          )}
+        </div>
+        <div ref={wipQueueStatusRef} className="shrink-0">
+          {!hideWipQueueStatus && <WipQueueStatus taskId={summaryTaskId} />}
+        </div>
         <PanelBody
           padding={false}
           scroll={false}
@@ -1547,6 +1578,7 @@ export const TaskChatPanel = memo(function TaskChatPanel({
                 taskId={taskId}
                 sessionId={resolvedSessionId}
                 worktreePath={getSessionWorkspacePath(session)}
+                detailActive={detailActive}
                 onOpenFile={onOpenFile}
               >
                 <MessageList
@@ -1558,6 +1590,7 @@ export const TaskChatPanel = memo(function TaskChatPanel({
                   childrenByParentToolCallId={childrenByParentToolCallId}
                   taskId={taskId ?? undefined}
                   sessionId={resolvedSessionId}
+                  detailActive={detailActive}
                   messagesLoading={messagesLoading}
                   historyRefreshPending={historyRefreshPending}
                   historyStatus={historyStatus}
@@ -1567,6 +1600,7 @@ export const TaskChatPanel = memo(function TaskChatPanel({
                   sessionState={session?.state}
                   worktreePath={getSessionWorkspacePath(session)}
                   onOpenFile={onOpenFile}
+                  onOpenHistoricalDiff={onOpenHistoricalDiff}
                   dividerBeforeItemKey={dividerBeforeItemKey}
                   lastPromptMessageId={lastPromptMessageId}
                   lastPromptMessage={lastPromptMessage}
@@ -1619,33 +1653,39 @@ export const TaskChatPanel = memo(function TaskChatPanel({
               onLateAnswer={lateAnswer.send}
               lateAnswerState={lateAnswer.state}
               shortcutScopeRef={panelRef}
-              maxHeightVh={50}
+              initialMaxHeightVh={50}
+              allocationRef={panelRef}
+              anchorRef={panelRef}
+              reservedSiblingRefs={clarificationReservations}
+              reservedHeightPx={80}
             />
           )}
-          <ChatFooter
-            isArchived={isArchived}
-            chatInputRef={chatInputRef}
-            clarificationKey={clarificationKey}
-            onClarificationResolved={handleClarificationResolved}
-            handleSubmit={handleSubmit}
-            handleCancelTurn={handleCancelTurn}
-            showRequestChangesTooltip={showRequestChangesTooltip}
-            onRequestChangesTooltipDismiss={onRequestChangesTooltipDismiss}
-            panelState={panelState}
-            isSending={isSending}
-            hideSessionsDropdown={hideSessionsDropdown}
-            hidePlanMode={embedded}
-            showScrollToLastPrompt={showScrollButton}
-            onScrollToLastPrompt={scrollToLastPrompt}
-            lastPromptScrollDirection={scrollDirection}
-            showJumpToLatest={showJumpToLatest}
-            onJumpToLatest={jumpToLatest}
-            showScrollToStart={showScrollToStartButton}
-            onScrollToStart={scrollToStart}
-            statusTaskId={statusTaskId ?? taskIdHint}
-            showAgentStartHint={showAgentStartHint}
-            launchErrorOwned={launchErrorOwned}
-          />
+          <div ref={chatFooterRef} className="shrink-0">
+            <ChatFooter
+              isArchived={isArchived}
+              chatInputRef={chatInputRef}
+              clarificationKey={clarificationKey}
+              onClarificationResolved={handleClarificationResolved}
+              handleSubmit={handleSubmit}
+              handleCancelTurn={handleCancelTurn}
+              showRequestChangesTooltip={showRequestChangesTooltip}
+              onRequestChangesTooltipDismiss={onRequestChangesTooltipDismiss}
+              panelState={panelState}
+              isSending={isSending}
+              hideSessionsDropdown={hideSessionsDropdown}
+              hidePlanMode={embedded}
+              showScrollToLastPrompt={showScrollButton}
+              onScrollToLastPrompt={scrollToLastPrompt}
+              lastPromptScrollDirection={scrollDirection}
+              showJumpToLatest={showJumpToLatest}
+              onJumpToLatest={jumpToLatest}
+              showScrollToStart={showScrollToStartButton}
+              onScrollToStart={scrollToStart}
+              statusTaskId={statusTaskId ?? taskIdHint}
+              showAgentStartHint={showAgentStartHint}
+              launchErrorOwned={launchErrorOwned}
+            />
+          </div>
         </ComposerFooterAllocation>
       </PanelRoot>
     </SessionRecoveryProvider>
@@ -1721,6 +1761,7 @@ function ChatFooter({
           <ConversationUsageDisplay
             taskId={panelState.taskId ?? statusTaskId}
             sessionId={panelState.resolvedSessionId}
+            detailActive={panelState.detailActive}
           />
           <JumpToLatestButton isVisible={showJumpToLatest} onClick={onJumpToLatest} />
         </div>

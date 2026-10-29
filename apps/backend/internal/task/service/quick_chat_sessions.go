@@ -5,6 +5,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/kandev/kandev/internal/auth/authn"
 	"github.com/kandev/kandev/internal/task/models"
 )
 
@@ -30,6 +31,7 @@ type QuickChatSession struct {
 	Kind           string
 	Name           string
 	AgentProfileID string
+	CreationID     string
 	Session        *models.TaskSession
 
 	createdAt time.Time
@@ -76,7 +78,11 @@ func (s *Service) ListQuickChatSessions(ctx context.Context, workspaceID string)
 		if primary == nil || primary.ID == "" {
 			continue
 		}
-		items = append(items, newQuickChatSession(task, primary))
+		item := newQuickChatSession(task, primary)
+		if identity, ok := authn.IdentityFromContext(ctx); ok {
+			item.CreationID, _ = QuickChatCreationIDForPrincipal(identity.UserID, task.ExternalID)
+		}
+		items = append(items, item)
 	}
 	sortQuickChatSessions(items)
 	return items, nil
@@ -131,12 +137,7 @@ func (s *Service) listQuickChatTasks(ctx context.Context, workspaceID string) ([
 // (docs/specs/coordinator/system-design/copilot.md#conversation-task): the
 // coordinator popover is the conversation task's only surface.
 func IsRestorableQuickChatTask(task *models.Task) bool {
-	return task != nil &&
-		task.IsEphemeral &&
-		task.WorkflowID == "" &&
-		task.Origin != models.TaskOriginAutomationRun &&
-		task.Origin != models.TaskOriginCoordinator &&
-		!IsManagedConversationTask(task)
+	return models.IsRestorableQuickChatTask(task)
 }
 
 func quickChatSessionKind(task *models.Task) string {

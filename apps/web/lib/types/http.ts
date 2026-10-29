@@ -22,6 +22,7 @@ import type { TaskStatusSummary } from "./task-status-summary";
 import type { AgentGoalReconciliation } from "@/lib/agent-goal";
 
 export type { TaskStatusSummary } from "./task-status-summary";
+export type * from "./http-mcp";
 
 export type { ExecutorProvider, ExecutorProviderCapabilities, ExecutorType } from "./executor";
 export type { ActiveSubagentCountFields, ForegroundActivity } from "./activity";
@@ -66,6 +67,9 @@ export type {
   TaskRepository,
   WorkspaceFolder,
   WorkspaceFolderSourceRequest,
+  WorkspaceRepositoryPlacement,
+  WorkspaceRepositoryPlacementOption,
+  WorkspaceRepositoryPlacementPreview,
   WorkspaceRepositorySourceRequest,
   WorkspaceSourceRequest,
 } from "./http-workspace-sources";
@@ -100,6 +104,8 @@ export type TaskState =
   | "CANCELLED";
 
 export type TaskPriority = "critical" | "high" | "medium" | "low";
+
+export type InitialWorkspaceLayout = "repository" | "task_root";
 
 // Workflow Review Status
 export type WorkflowReviewStatus = "pending" | "approved" | "changes_requested" | "rejected";
@@ -435,6 +441,8 @@ export function primaryTaskRepository(
 
 export type Task = ActiveSubagentCountFields & {
   id: TaskId;
+  /** Caller-supplied create-idempotency identity, absent once released. */
+  external_id?: string;
   workspace_id: WorkspaceId;
   workflow_id: WorkflowId;
   workflow_step_id: string;
@@ -453,6 +461,8 @@ export type Task = ActiveSubagentCountFields & {
   queued_for_step_id?: string;
   queued_at?: string | null;
   repositories?: TaskRepository[];
+  /** Initial working-directory layout for task creation. */
+  initial_workspace_layout?: InitialWorkspaceLayout;
   workspace_folders?: WorkspaceFolder[];
   primary_session_id?: SessionId | null;
   primary_session_state?: TaskSessionState | null;
@@ -529,6 +539,7 @@ export type Task = ActiveSubagentCountFields & {
 
 // Task origin values mirror models.TaskOrigin* constants in the Go backend.
 export type TaskOrigin =
+  | "coordinator"
   | "manual"
   | "agent_created"
   | "routine"
@@ -545,6 +556,14 @@ export type CreateTaskResponse = Task & {
   session_id?: string;
   agent_execution_id?: string;
   agent_profile_id?: AgentProfileId;
+  /**
+   * Native REST creation metadata. Required on a native create response;
+   * absent on custom plugin transports that keep their own contract.
+   * `creation_complete` is false only when the matching task exists but its
+   * required synchronous creation work has not settled.
+   */
+  deduplicated?: boolean;
+  creation_complete?: boolean;
 };
 
 // Backend workflow step DTO (flat fields, as returned from API)
@@ -664,6 +683,50 @@ export type WorkspaceRecoveryProjection = {
   reason_code?: string;
 };
 
+/** Path-free identity and cause for one currently open session recovery block. */
+export type SessionRecoveryBlockProjection = {
+  id: string;
+  incarnation_id: string;
+  expected_generation: number;
+  reason: string;
+  consumer_reference?: string;
+  delivery_submission_id?: string;
+  delivery_stream_id?: string;
+  updated_at: string;
+};
+
+/** Bounded storage evidence shared by live pressure and terminal causes. */
+export type RuntimeStorageFailure = {
+  reason?: string;
+  location?: string;
+  executor_label?: string;
+  observed_at?: string;
+  disk_available_bytes?: number;
+  disk_required_bytes?: number;
+  retained_bytes?: number;
+  limit_bytes?: number;
+  event_bytes?: number;
+};
+
+/** Runtime-only advisory storage state owned by the lifecycle observation. */
+export type RuntimeStorageHealth = {
+  state: "warning" | "normal" | "unavailable";
+  storage_kind?: "journal" | "workspace";
+  location: "local_runtime" | "executor_runtime" | "unknown";
+  executor_label?: string;
+  total_bytes?: number;
+  available_bytes?: number;
+  observed_at?: string;
+  /** Backend receipt age. Browser freshness adds local monotonic elapsed time. */
+  age_seconds?: number;
+  write_pressure?: boolean;
+  producer_paused?: boolean;
+  delivery_state?: string;
+  failure_storage?: RuntimeStorageFailure;
+  revision: number;
+  epoch: number;
+};
+
 export type TaskSession = ActiveSubagentCountFields & {
   id: SessionId;
   task_id: TaskId;
@@ -708,11 +771,15 @@ export type TaskSession = ActiveSubagentCountFields & {
   task_environment_id?: string;
   /** Latest path-free managed workspace recovery operation for this environment. */
   workspace_recovery?: WorkspaceRecoveryProjection | null;
+  /** Current native-generation recovery causes; an empty array clears stale blocks. */
+  session_recovery_blocks?: SessionRecoveryBlockProjection[];
   state: TaskSessionState;
   /** Backend-owned runtime cancellation projection; API responses include it explicitly. */
   cancellation_pending?: boolean;
   /** Process-local cancellation transition generation used to reject stale snapshots. */
   cancellation_revision?: number;
+  /** Live advisory capacity; omitted by older backends and healthy peers. */
+  runtime_storage_health?: RuntimeStorageHealth | null;
   /** Fine-grained busy substate; background may outlive the foreground turn (ADR-0049). */
   foreground_activity?: ForegroundActivity | null;
   /**
@@ -1011,6 +1078,7 @@ export type ListWorkspacesResponse = {
 };
 
 export type Executor = {
+  owner_user_id?: string | null;
   id: string;
   name: string;
   type: ExecutorType;
@@ -1030,6 +1098,7 @@ export type ProfileEnvVar = {
 };
 
 export type ExecutorProfile = {
+  owner_user_id?: string | null;
   id: string;
   executor_id: string;
   executor_type?: ExecutorType;
@@ -1079,6 +1148,13 @@ export type ListMessagesResponse = {
   total: number;
   has_more: boolean;
   cursor: string;
+  turns?: Turn[];
+  turn_coverage?: MessageTurnCoverage;
+};
+
+export type MessageTurnCoverage = {
+  message_ids: string[];
+  active_turn_id: string | null;
 };
 
 export type MessageAuthorType = "user" | "agent";
@@ -1159,6 +1235,7 @@ export type AgentProfilePortable = {
   agent_name: string;
   model?: string;
   mode?: string;
+  config_options?: Record<string, string>;
 };
 
 export type WorkflowPortable = {

@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/kandev/kandev/internal/agentctl/journal"
 	"github.com/kandev/kandev/internal/agentctl/server/adapter"
+	"github.com/kandev/kandev/internal/agentctl/types/streams"
 )
 
 type deliverySubmissionRequest struct {
@@ -79,7 +80,7 @@ func (s *Server) handleDeliverySubmission(c *gin.Context) {
 	if !ok {
 		return
 	}
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxDeliverySubmissionRequestBytes(deliveryJournal.MaxEventBytes()))
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxDeliverySubmissionRequestBytes(deliveryJournal.MaxSubmissionBytes()))
 	var request deliverySubmissionRequest
 	if err := c.ShouldBindJSON(&request); err != nil {
 		var maxBytesError *http.MaxBytesError
@@ -106,11 +107,17 @@ func (s *Server) handleDeliverySubmission(c *gin.Context) {
 		case errors.Is(err, journal.ErrSubmissionConflict):
 			status = http.StatusConflict
 			code = "SUBMISSION_CONFLICT"
+		case errors.Is(err, journal.ErrEventTooLarge):
+			status = http.StatusRequestEntityTooLarge
+			code = "EVENT_TOO_LARGE"
 		case errors.Is(err, journal.ErrStreamFull):
 			status = http.StatusRequestEntityTooLarge
 			code = "SUBMISSION_TOO_LARGE"
+		case errors.Is(err, journal.ErrJournalFull):
+			status = http.StatusInsufficientStorage
+			code = "STORAGE_FULL"
 		}
-		c.JSON(status, gin.H{"code": code, "message": code})
+		c.JSON(status, deliveryErrorBody(code, err))
 		return
 	}
 	c.JSON(http.StatusOK, submission)
@@ -164,6 +171,9 @@ func (s *Server) handleDeliverySubmissionRetire(c *gin.Context) {
 	}
 	if s.procMgr == nil {
 		writeDeliveryError(c, journal.ErrOwnerMismatch)
+		return
+	}
+	if c.Request.ContentLength != 0 && !s.validateInterruptedRetirement(c) {
 		return
 	}
 	if err := s.procMgr.RetireDeliverySubmission(
@@ -468,8 +478,28 @@ func writeDeliveryError(c *gin.Context, err error) {
 		status, code = http.StatusConflict, deliveryOwnerMismatchCode
 	case errors.Is(err, journal.ErrSubmissionNotFound):
 		status, code = http.StatusNotFound, "SUBMISSION_NOT_FOUND"
+	case errors.Is(err, journal.ErrSubmissionConflict):
+		status, code = http.StatusConflict, "SUBMISSION_CONFLICT"
 	case errors.Is(err, journal.ErrSubmissionState):
 		status, code = http.StatusConflict, "SUBMISSION_STATE"
+	case errors.Is(err, journal.ErrEventTooLarge):
+		status, code = http.StatusRequestEntityTooLarge, "EVENT_TOO_LARGE"
+	case errors.Is(err, journal.ErrReplayPageTooLarge):
+		status, code = http.StatusRequestEntityTooLarge, "REPLAY_PAGE_TOO_LARGE"
+	case errors.Is(err, journal.ErrStreamFull):
+		status, code = http.StatusRequestEntityTooLarge, "SUBMISSION_TOO_LARGE"
+	case errors.Is(err, journal.ErrJournalFull):
+		status, code = http.StatusInsufficientStorage, "STORAGE_FULL"
 	}
-	c.JSON(status, gin.H{"code": code, "message": code})
+	c.JSON(status, deliveryErrorBody(code, err))
+}
+
+// deliveryErrorBody keeps the legacy code/message shape and adds validated
+// storage evidence only when the source produced it.
+func deliveryErrorBody(code string, err error) gin.H {
+	body := gin.H{"code": code, "message": code}
+	if diagnostic := streams.DeliveryStorageDiagnosticFromError(err); diagnostic != nil {
+		body["storage"] = diagnostic
+	}
+	return body
 }

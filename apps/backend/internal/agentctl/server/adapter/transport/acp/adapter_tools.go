@@ -709,6 +709,7 @@ func (a *Adapter) convertToolCallResultUpdate(sessionID string, tcu *acp.Session
 	recognizedShellUpdate := false
 	if payload != nil && payload.Kind() == streams.ToolKindShellExec {
 		recognizedShellUpdate = a.normalizer.NormalizeShellToolUpdate(payload, tcu.Meta, convertedContents, tcu.RawOutput)
+		a.normalizer.confirmBackgroundLaunch(payload, tcu.RawOutput)
 	} else if tcu.RawOutput != nil && payload != nil && !isTrackedMonitorTerminal {
 		result := tcu.RawOutput
 		if canonicalMCPUpdate {
@@ -782,6 +783,14 @@ func (a *Adapter) convertToolCallResultUpdate(sessionID string, tcu *acp.Session
 		}
 	}
 
+	parentToolCallID := parentToolUseID(tcu.Meta)
+	if codexParentToolCallID != "" {
+		parentToolCallID = codexParentToolCallID
+	}
+	if parentToolCallID == "" {
+		parentToolCallID = a.toolCallParents[emittedToolCallID]
+	}
+
 	if isTerminal {
 		if payload == nil || !payload.IsActiveBackgroundWork() {
 			delete(a.activeToolCalls, emittedToolCallID)
@@ -837,10 +846,6 @@ func (a *Adapter) convertToolCallResultUpdate(sessionID string, tcu *acp.Session
 	var title string
 	if tcu.Title != nil {
 		title = *tcu.Title
-	}
-	parentToolCallID := parentToolUseID(tcu.Meta)
-	if codexParentToolCallID != "" {
-		parentToolCallID = codexParentToolCallID
 	}
 
 	return &AgentEvent{

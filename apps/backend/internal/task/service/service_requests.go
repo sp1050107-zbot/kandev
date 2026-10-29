@@ -92,6 +92,13 @@ type CreateTaskRequest struct {
 	// server-authored provenance fields. It is internal-only and never decoded
 	// from a request body; ordinary task creation cannot forge those fields.
 	TrustedHandoffMetadata bool `json:"-"`
+	// AutomationStartOwned reserves the new task's initial start for the
+	// automation run that creates it (models.MetaKeyAutomationStartOwned). It is
+	// internal-only: the marker suppresses workflow auto-start, so it is never
+	// accepted from Metadata or decoded from a request body.
+	AutomationStartOwned bool `json:"-"`
+	// AutomationStartOwner identifies the admitted run; unbound internal starts receive a fresh token.
+	AutomationStartOwner string `json:"-"`
 	// WorkflowAgentOverrides groups one replacement by source profile. The
 	// service expands it to fixed workflow-step bindings before insertion.
 	WorkflowAgentOverrides           map[string]string              `json:"workflow_agent_overrides,omitempty"`
@@ -99,9 +106,17 @@ type CreateTaskRequest struct {
 	// ExecutorID and ExecutorProfileID are resolved by authenticated create
 	// adapters and are used to validate task-scoped replacement profiles before
 	// any task row is written.
-	ExecutorID        string                 `json:"-"`
-	ExecutorProfileID string                 `json:"-"`
-	DeferredLaunch    map[string]interface{} `json:"deferred_launch,omitempty"`
+	ExecutorID        string `json:"-"`
+	ExecutorProfileID string `json:"-"`
+	// ExecutorProfileIDExplicit marks a caller-selected profile. Deferred
+	// inherited profile IDs remain valid until launch-time admission.
+	ExecutorProfileIDExplicit bool `json:"-"`
+	// Attachments is the creation-time submission. File-backed descriptors are
+	// claimed atomically with the task row; the bounded inline compatibility
+	// path stays on DeferredLaunch.
+	Attachments    []v1.MessageAttachment `json:"attachments,omitempty"`
+	DeferredLaunch map[string]interface{} `json:"deferred_launch,omitempty"`
+	MCPServerIDs   []string               `json:"mcp_server_ids,omitempty"`
 	// RecordAgentProfileRecentUse opts this deferred launch into task_create
 	// profile-history attribution. Only the authenticated HTTP/WS selector
 	// surfaces set it; programmatic callers such as MCP must leave it false.
@@ -116,6 +131,13 @@ type CreateTaskRequest struct {
 	ParentID      string `json:"parent_id,omitempty"`
 	Autopilot     bool   `json:"autopilot,omitempty"`
 	WorkspacePath string `json:"workspace_path,omitempty"` // Optional host folder for repo-less tasks
+	// InitialWorkspaceLayout selects the agent root for the first Worktree
+	// environment. Empty uses the safe repository-root default.
+	InitialWorkspaceLayout string `json:"initial_workspace_layout,omitempty"`
+	// Executor selection is supplied by authenticated API adapters for creation
+	// time layout validation. These fields are internal to the service request;
+	// the public JSON shape belongs to the adapters.
+	ExecutorType string `json:"-"`
 	// WorkspacePolicy carries the effective policy resolved by an API adapter.
 	// When omitted, CreateTask derives child defaults from the persisted parent.
 	WorkspacePolicy *WorkspacePolicy `json:"-"`
@@ -124,12 +146,9 @@ type CreateTaskRequest struct {
 	// (docs/specs/tasks/requirements/external-id-idempotency.md). Accepted on REST
 	// and MCP; empty means no idempotency key.
 	ExternalID string `json:"external_id,omitempty"`
-	// AllowReservedExternalID permits ExternalID to carry the
-	// ReservedExternalIDPrefixCoordinatorProposal prefix, which every other
-	// caller is refused (docs/specs/coordinator/system-design/proposals.md#reserved-prefix).
-	// Tagged json:"-" so no HTTP or MCP request body can set it; only the
-	// coordinator service sets it, when creating the task behind an approved
-	// proposal.
+	// AllowReservedExternalID permits an internal adapter to claim a reserved
+	// external identity namespace. Tagged json:"-" so public HTTP and MCP
+	// request bodies cannot set it.
 	AllowReservedExternalID bool `json:"-"`
 	// AllowReservedMetadata permits Metadata keys with the
 	// ReservedMetadataKeyPrefixCoordinator prefix. Tagged json:"-" so no
@@ -331,25 +350,28 @@ type UpdateRepositoryRequest struct {
 
 // CreateExecutorRequest contains the data for creating an executor
 type CreateExecutorRequest struct {
-	Name      string                `json:"name"`
-	Type      models.ExecutorType   `json:"type"`
-	Status    models.ExecutorStatus `json:"status"`
-	IsSystem  bool                  `json:"is_system"`
-	Resumable bool                  `json:"resumable"`
-	Config    map[string]string     `json:"config,omitempty"`
+	OwnerUserID string                `json:"owner_user_id,omitempty"`
+	Name        string                `json:"name"`
+	Type        models.ExecutorType   `json:"type"`
+	Status      models.ExecutorStatus `json:"status"`
+	IsSystem    bool                  `json:"is_system"`
+	Resumable   bool                  `json:"resumable"`
+	Config      map[string]string     `json:"config,omitempty"`
 }
 
 // UpdateExecutorRequest contains the data for updating an executor
 type UpdateExecutorRequest struct {
-	Name      *string                `json:"name,omitempty"`
-	Type      *models.ExecutorType   `json:"type,omitempty"`
-	Status    *models.ExecutorStatus `json:"status,omitempty"`
-	Resumable *bool                  `json:"resumable,omitempty"`
-	Config    map[string]string      `json:"config,omitempty"`
+	OwnerUserID models.OptionalOwner   `json:"owner_user_id,omitzero"`
+	Name        *string                `json:"name,omitempty"`
+	Type        *models.ExecutorType   `json:"type,omitempty"`
+	Status      *models.ExecutorStatus `json:"status,omitempty"`
+	Resumable   *bool                  `json:"resumable,omitempty"`
+	Config      map[string]string      `json:"config,omitempty"`
 }
 
 // CreateExecutorProfileRequest contains the data for creating an executor profile
 type CreateExecutorProfileRequest struct {
+	OwnerUserID   string                 `json:"owner_user_id,omitempty"`
 	ExecutorID    string                 `json:"executor_id"`
 	Name          string                 `json:"name"`
 	McpPolicy     string                 `json:"mcp_policy"`
@@ -361,6 +383,7 @@ type CreateExecutorProfileRequest struct {
 
 // UpdateExecutorProfileRequest contains the data for updating an executor profile
 type UpdateExecutorProfileRequest struct {
+	OwnerUserID       models.OptionalOwner   `json:"owner_user_id,omitzero"`
 	Name              *string                `json:"name,omitempty"`
 	McpPolicy         *string                `json:"mcp_policy,omitempty"`
 	Config            map[string]string      `json:"config,omitempty"`
@@ -400,9 +423,10 @@ type ListMessagesRequest struct {
 	AuthorType    string
 	// AuthorTypes narrows by any listed author; when non-empty it takes
 	// precedence over AuthorType. TaskID narrows the page to one task.
-	AuthorTypes []string
-	TaskID      string
-	Around      string
+	AuthorTypes  []string
+	TaskID       string
+	Around       string
+	IncludeTurns bool
 }
 
 // CreateRepositoryScriptRequest contains the data for creating a repository script

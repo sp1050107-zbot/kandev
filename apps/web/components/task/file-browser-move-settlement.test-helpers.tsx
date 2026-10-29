@@ -256,6 +256,7 @@ function renderScenario(session: ScenarioSession) {
         editors: { items: [], loaded: true, loading: false, folderOpeningAvailable: false },
         userSettings: { ...defaultState.userSettings, loaded: true },
         connection: { status: "connected", error: null, issueSeverity: "none" },
+        tasks: { ...defaultState.tasks, activeSessionId: id },
         taskSessions: { items: { [id]: session } },
         environmentIdBySessionId: { [id]: session.environment_id },
         sessionAgentctl: { itemsBySessionId: { [id]: { status: "ready" } } },
@@ -301,7 +302,7 @@ function scenarioActions(
       Array.from(
         view.container.querySelectorAll<HTMLElement>("[data-testid='file-tree-node']"),
       ).map((node) => node.dataset.path!),
-    async drag(paths = ["alpha.txt", "beta.txt"]) {
+    async drag(paths = ["alpha.txt", "beta.txt"], expectedRootCount = paths.length) {
       for (const path of paths) {
         await act(async () => {
           fireEvent.click(row(path)!, { ctrlKey: true });
@@ -313,7 +314,7 @@ function scenarioActions(
         expect(JSON.parse(dataTransfer.getData("text/plain"))).toEqual(paths);
         fireEvent.drop(row("dest")!, { dataTransfer });
       });
-      expect(renames).toHaveLength(paths.length);
+      expect(renames).toHaveLength(expectedRootCount);
     },
     async settle(index: number, outcome: boolean | Error) {
       await act(async () => {

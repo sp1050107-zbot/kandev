@@ -6,6 +6,7 @@ import { useCallback, useMemo, useState } from "react";
 import { useAppStore, useAppStoreApi } from "@/components/state-provider";
 import { linkToTask } from "@/lib/links";
 import { useRouter } from "@/lib/routing/client-router";
+import { mapWorkflowItem } from "@/lib/routing/route-bootstrap";
 import { fetchWorkflowSnapshot, listWorkflows } from "@/lib/api";
 import { useWorkspaceSidebarTasks } from "@/hooks/domains/kanban/use-workspace-sidebar-tasks";
 import {
@@ -198,6 +199,7 @@ export function useSheetData(workspaceId: string | null) {
   );
 
   return {
+    allTasks,
     activeTaskId,
     selectedTaskId,
     workspaces,
@@ -319,12 +321,7 @@ async function switchWorkspace(newWorkspaceId: string, opts: SheetNavOptions) {
           ...state.workflows.items.filter(
             (w: { workspaceId: string }) => w.workspaceId !== newWorkspaceId,
           ),
-          ...newWorkspaceWorkflows.map((w) => ({
-            id: w.id,
-            workspaceId: w.workspace_id,
-            name: w.name,
-            hidden: w.hidden,
-          })),
+          ...newWorkspaceWorkflows.map(mapWorkflowItem),
         ],
         activeId: firstWorkflow.id,
         taskWorkflowCoverage,
@@ -629,8 +626,8 @@ function useSheetDeleteActions(
  * Re-parent via drag: runs the same composite nest operation the context menu
  * uses, resolving the workflow from the snapshot keys.
  */
-function useSheetNestTask() {
-  return useNestTaskByDrag();
+function useSheetNestTask(pageTasks: readonly TaskSwitcherItem[]) {
+  return useNestTaskByDrag(pageTasks);
 }
 
 export function useSheetArchiveActions(
@@ -702,6 +699,7 @@ export function useSheetActions(
   onOpenChange: (open: boolean) => void,
   selection: TaskSheetSelectionController,
   navigate?: (taskId: string, sessionId?: string) => void,
+  pageTasks: readonly TaskSwitcherItem[] = [],
 ) {
   const router = useRouter();
   const navigateTask = useCallback(
@@ -725,8 +723,8 @@ export function useSheetActions(
     notifySuccess,
   });
   const deleteActions = useSheetDeleteActions(store, runTaskRemoval);
-  const detachActions = useTaskDetachDialog(store);
-  const handleNestTask = useSheetNestTask();
+  const detachActions = useTaskDetachDialog(store, pageTasks);
+  const handleNestTask = useSheetNestTask(pageTasks);
   const handleSelectTask = useCallback(
     (taskId: string) => {
       const state = store.getState();

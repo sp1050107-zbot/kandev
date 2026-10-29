@@ -15,6 +15,7 @@ import (
 	"github.com/kandev/kandev/internal/agentctl/types/streams"
 	"github.com/kandev/kandev/internal/common/logger"
 	"github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/repository/repoerrors"
 )
 
 // StreamCallbacks defines callbacks for stream events
@@ -39,25 +40,38 @@ type StreamCallbacks struct {
 
 // StreamManager manages WebSocket streams to agent executions
 type StreamManager struct {
-	logger                        *logger.Logger
-	callbacks                     StreamCallbacks
-	reconciliationMu              sync.Mutex
-	deliveryReconciliations       map[string]*deliveryReconciliationCycle
-	stoppedReconciliations        map[string]struct{}
-	reconciliationContext         context.Context
-	reconciliationCancel          context.CancelFunc
-	reconciliationNow             func() time.Time
-	reconciliationWait            func(context.Context, time.Duration) error
-	isExecutionCurrent            func(*AgentExecution) bool
-	onDeliveryReconciliationPhase func(*AgentExecution, DeliveryReconciliationIdentity, DeliveryReconciliationPhase)
-	deliverySubmissionSettler     func(context.Context, *AgentExecution, DeliveryReconciliationIdentity, *journal.Submission) (bool, error)
-	deliveryMu                    sync.RWMutex
-	delivery                      AgentDeliveryRepository
-	ackMu                         sync.Mutex
-	ackWorkers                    map[string]*durableDeliveryAckWorker
-	ackWG                         sync.WaitGroup
-	mcpMu                         sync.RWMutex
-	mcpHandler                    agentctl.MCPHandler
+	logger                         *logger.Logger
+	callbacks                      StreamCallbacks
+	reconciliationMu               sync.Mutex
+	deliveryReconciliations        map[string]*deliveryReconciliationCycle
+	stoppedReconciliations         map[string]struct{}
+	reconciliationContext          context.Context
+	reconciliationCancel           context.CancelFunc
+	reconciliationNow              func() time.Time
+	reconciliationWait             func(context.Context, time.Duration) error
+	deliveryHealthClock            func() time.Time
+	deliveryHealthWait             func(context.Context, time.Duration) error
+	deliveryHealthProbeInterval    time.Duration
+	deliveryHealthProbeTimeout     time.Duration
+	deliveryHealthRecoveryCooldown time.Duration
+	runtimeStorageProbeInterval    time.Duration
+	runtimeStorageSlots            chan struct{}
+	runtimeStorageAdvisories       sync.Map
+	onRuntimeStorageProbe          func(context.Context, *AgentExecution, RuntimeStorageProbeResult)
+	onRuntimeStoragePressure       func(context.Context, *AgentExecution, RuntimeStoragePressure)
+	onRuntimeStorageDetached       func(*AgentExecution, *deliveryStreamAttachment)
+	deliveryAttachments            sync.Map
+	isExecutionCurrent             func(*AgentExecution) bool
+	onDeliveryReconciliationPhase  func(*AgentExecution, DeliveryReconciliationIdentity, DeliveryReconciliationPhase)
+	deliverySubmissionSettler      func(context.Context, *AgentExecution, DeliveryReconciliationIdentity, *journal.Submission) (bool, error)
+	deliveryMu                     sync.RWMutex
+	delivery                       AgentDeliveryRepository
+	ackMu                          sync.Mutex
+	ackWorkers                     map[string]*durableDeliveryAckWorker
+	ackStopped                     bool
+	ackWG                          sync.WaitGroup
+	mcpMu                          sync.RWMutex
+	mcpHandler                     agentctl.MCPHandler
 	// mcpIdentityScoper scopes in-session MCP dispatches to the owner of the
 	// stream's task. Nil leaves dispatch unscoped (single-user instances and
 	// isolated tests); set via Manager.SetMCPIdentityScoper.
@@ -170,18 +184,23 @@ func (c *stopChannelContext) Err() error {
 func NewStreamManager(log *logger.Logger, callbacks StreamCallbacks, mcpHandler agentctl.MCPHandler, stopCh <-chan struct{}) *StreamManager {
 	reconciliationContext, reconciliationCancel := context.WithCancel(context.Background())
 	return &StreamManager{
-		logger:                  log.WithFields(zap.String("component", "stream-manager")),
-		callbacks:               callbacks,
-		mcpHandler:              mcpHandler,
-		stopCh:                  stopCh,
-		waitCh:                  make(chan struct{}),
-		ackWorkers:              make(map[string]*durableDeliveryAckWorker),
-		deliveryReconciliations: make(map[string]*deliveryReconciliationCycle),
-		stoppedReconciliations:  make(map[string]struct{}),
-		reconciliationContext:   reconciliationContext,
-		reconciliationCancel:    reconciliationCancel,
-		reconciliationNow:       time.Now,
-		reconciliationWait:      waitForReconciliation,
+		logger:                         log.WithFields(zap.String("component", "stream-manager")),
+		callbacks:                      callbacks,
+		mcpHandler:                     mcpHandler,
+		stopCh:                         stopCh,
+		waitCh:                         make(chan struct{}),
+		ackWorkers:                     make(map[string]*durableDeliveryAckWorker),
+		deliveryReconciliations:        make(map[string]*deliveryReconciliationCycle),
+		stoppedReconciliations:         make(map[string]struct{}),
+		reconciliationContext:          reconciliationContext,
+		reconciliationCancel:           reconciliationCancel,
+		reconciliationNow:              time.Now,
+		reconciliationWait:             waitForReconciliation,
+		deliveryHealthClock:            time.Now,
+		deliveryHealthProbeInterval:    defaultDeliveryHealthProbeInterval,
+		deliveryHealthProbeTimeout:     defaultDeliveryHealthProbeTimeout,
+		deliveryHealthRecoveryCooldown: defaultDeliveryHealthCooldown,
+		runtimeStorageSlots:            make(chan struct{}, defaultRuntimeStorageConcurrency),
 	}
 }
 
@@ -192,6 +211,54 @@ func NewStreamManager(log *logger.Logger, callbacks StreamCallbacks, mcpHandler 
 func (sm *StreamManager) ConnectAll(execution *AgentExecution, ready chan<- struct{}) {
 	sm.connectUpdatesStreamAsync(execution, ready)
 	sm.ConnectWorkspaceStream(execution, nil)
+}
+
+// ConnectAllAndWait waits until the updates stream connection attempt has
+// finished and verifies the stream is attached before callers admit prompts.
+// The stream itself keeps the execution and manager lifetime, not this waiter's
+// shorter recovery-attempt context.
+func (sm *StreamManager) ConnectAllAndWait(ctx context.Context, execution *AgentExecution) error {
+	if sm == nil || execution == nil {
+		return errors.New("stream manager or execution is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if client, releaseClient := execution.AcquireAgentCtlClient(); client != nil {
+		connected := client.HasAgentStream()
+		releaseClient()
+		if connected {
+			return nil
+		}
+	} else {
+		return errors.New("agentctl client is unavailable")
+	}
+
+	ready := make(chan struct{})
+	sm.ConnectAll(execution, ready)
+	select {
+	case <-ready:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-sm.waitCh:
+		return errors.New("stream manager stopped before updates stream connected")
+	case <-sm.stopCh:
+		return errors.New("stream manager stopped before updates stream connected")
+	}
+
+	client, releaseClient := execution.AcquireAgentCtlClient()
+	if client == nil {
+		return errors.New("agentctl client became unavailable before updates stream connected")
+	}
+	connected := client.HasAgentStream()
+	releaseClient()
+	if !connected {
+		if err := execution.deliveryStreamFailureSnapshot(); err != nil {
+			return err
+		}
+		return errors.New("agent updates stream did not connect")
+	}
+	return nil
 }
 
 func (sm *StreamManager) connectUpdatesStreamAsync(execution *AgentExecution, ready chan<- struct{}) {
@@ -233,6 +300,7 @@ func (sm *StreamManager) Wait() {
 	sm.waitChOnce.Do(func() { close(sm.waitCh) })
 	sm.wg.Wait()
 	sm.ackMu.Lock()
+	sm.ackStopped = true
 	for _, worker := range sm.ackWorkers {
 		worker.cancel()
 	}
@@ -357,7 +425,8 @@ func (sm *StreamManager) connectUpdatesStream(execution *AgentExecution, ready c
 	if streamID == "" {
 		streamID = execution.SessionID
 	}
-	after, cursorErr := sm.deliveryReplayCursor(ctx, delivery, streamID)
+	after, cursorErr := sm.initialDeliveryReplayCursor(ctx, execution, delivery, client, streamID)
+	execution.recordDeliveryStreamFailure(startupGeneration, cursorErr)
 	if cursorErr != nil {
 		sm.logger.Error("failed to load durable delivery replay cursor",
 			zap.String("instance_id", execution.ID),
@@ -370,17 +439,20 @@ func (sm *StreamManager) connectUpdatesStream(execution *AgentExecution, ready c
 		return
 	}
 
+	if execution.DeliveryMode == DurableDeliveryV1 && after > 0 {
+		sm.scheduleDurableDeliveryAck(execution, client, agentctl.AgentEvent{DeliveryStreamID: streamID, DeliverySequence: after})
+	}
+
 	processor := newStreamEventProcessor(sm, ctx, execution, client, delivery, startupGeneration)
-	err := client.StreamUpdatesFrom(ctx, func(event agentctl.AgentEvent) {
-		if !processor.enqueue(event) {
-			sm.logger.Error("durable agent event processor is unavailable",
-				zap.String("instance_id", execution.ID))
-			if processor.ctx.Err() == nil {
-				processor.fail(errStreamEventProcessorQueueFull)
-				client.CloseUpdatesStream()
-			}
-		}
+	monitorCtx, monitorCancel := context.WithCancel(ctx)
+	attachment := sm.startDeliveryHealthMonitor(monitorCtx, monitorCancel, execution, client)
+	// Processor failure cancels only this connection, including when no later
+	// frame arrives. Disconnect handling reports the original processing error.
+	err := client.StreamUpdatesFrom(processor.ctx, func(event agentctl.AgentEvent) {
+		processor.enqueue(event)
 	}, sm.mcpHandlerFor(execution), func(disconnectErr error) {
+		attachment.close()
+		monitorCancel()
 		processErr := processor.close()
 		if processErr != nil {
 			sm.logger.Error("durable agent event processing failed",
@@ -392,6 +464,10 @@ func (sm *StreamManager) connectUpdatesStream(execution *AgentExecution, ready c
 			}
 		}
 		if disconnectErr != nil {
+			if errors.Is(disconnectErr, errDeliveryReplayReconciled) {
+				sm.reconnectAfterExpiredDeliveryReplay(execution)
+				return
+			}
 			overloaded := errors.Is(disconnectErr, agentctl.ErrAgentEventQueueFull) ||
 				errors.Is(disconnectErr, errStreamEventProcessorQueueFull)
 			if overloaded && execution.DeliveryMode != DurableDeliveryV1 {
@@ -415,6 +491,11 @@ func (sm *StreamManager) connectUpdatesStream(execution *AgentExecution, ready c
 			sm.handleUpdatesDisconnectWithGeneration(execution, disconnectErr, startupGeneration)
 		}
 	}, after)
+	execution.recordDeliveryStreamFailure(startupGeneration, err)
+	if err != nil {
+		attachment.close()
+		monitorCancel()
+	}
 	releaseClient()
 
 	// Signal that the stream connection attempt is complete (success or failure)
@@ -425,9 +506,25 @@ func (sm *StreamManager) connectUpdatesStream(execution *AgentExecution, ready c
 	}
 
 	if err != nil {
+		processor.fail(err)
+		_ = processor.close()
 		sm.logger.Error("failed to connect to updates stream",
 			zap.String("instance_id", execution.ID),
 			zap.Error(err))
+	}
+}
+
+func (sm *StreamManager) reconnectAfterExpiredDeliveryReplay(execution *AgentExecution) {
+	if execution == nil || execution.DeliveryMode != DurableDeliveryV1 {
+		return
+	}
+	if !sm.start(func() {
+		if sm.sleepOrStop(20 * time.Millisecond) {
+			sm.connectUpdatesStream(execution, nil)
+		}
+	}) {
+		sm.logger.Debug("skipping expired delivery replay reconnect during shutdown",
+			zap.String("execution_id", execution.ID))
 	}
 }
 
@@ -463,11 +560,12 @@ func (sm *StreamManager) shouldReconnectAfterStreamOverload(
 }
 
 type preparedAgentEvent struct {
-	event          agentctl.AgentEvent
-	durableEvent   *models.AgentDeliveryEvent
-	deliveryEffect *models.AgentDeliveryEffect
-	skipCallback   bool
-	duplicate      bool
+	event               agentctl.AgentEvent
+	durableEvent        *models.AgentDeliveryEvent
+	deliveryEffect      *models.AgentDeliveryEffect
+	skipCallback        bool
+	skipAcknowledgement bool
+	duplicate           bool
 }
 
 func (sm *StreamManager) processAgentEvent(
@@ -492,9 +590,18 @@ func (sm *StreamManager) prepareAgentEvent(
 	delivery AgentDeliveryRepository,
 	event agentctl.AgentEvent,
 ) (preparedAgentEvent, error) {
+	if err := waitForDeliveryNegotiation(ctx, execution); err != nil {
+		return preparedAgentEvent{}, err
+	}
 	durable, err := durableAgentEventIdentity(execution, event)
 	if err != nil {
 		return preparedAgentEvent{}, err
+	}
+	if event.Type == streams.EventTypeShellOutputUpdate && (!durable || delivery == nil || event.ShellOutput == nil) {
+		return preparedAgentEvent{}, ErrDeliveryRecoveryBlocked
+	}
+	if event.ShellOutput != nil && event.Type != streams.EventTypeShellOutputUpdate {
+		return preparedAgentEvent{}, ErrDeliveryRecoveryBlocked
 	}
 	if !durable {
 		if event.DeliverySubmissionID != "" {
@@ -514,7 +621,7 @@ func (sm *StreamManager) prepareAgentEvent(
 	// remain byte-identical from admission through projection.
 	durableEvent := durableAgentEvent(execution, event)
 	process, skipCallback, effect, err := sm.prepareDurableAgentDeliveryEvent(
-		ctx, execution, durableEvent, delivery,
+		ctx, execution, durableEvent, delivery, client,
 	)
 	if err != nil {
 		return preparedAgentEvent{}, fmt.Errorf("durable agent event ownership check: %w", err)
@@ -555,6 +662,7 @@ func (sm *StreamManager) prepareDurableAgentDeliveryEvent(
 	execution *AgentExecution,
 	durableEvent *models.AgentDeliveryEvent,
 	repository AgentDeliveryRepository,
+	client *agentctl.Client,
 ) (process, skipCallback bool, effect *models.AgentDeliveryEffect, err error) {
 	if durableEvent == nil || durableEvent.StreamID == "" || durableEvent.Sequence == 0 {
 		return true, false, nil, nil
@@ -564,6 +672,16 @@ func (sm *StreamManager) prepareDurableAgentDeliveryEvent(
 		return false, false, nil, err
 	}
 	process, err = sm.receiveDurableAgentDeliveryEvent(ctx, durableEvent, repository)
+	if errors.Is(err, repoerrors.ErrAgentDeliveryReplayExpired) {
+		projected, recoveryErr := reconcileExpiredAgentDeliveryReplay(
+			ctx, execution, durableEvent, repository, client, client,
+		)
+		if recoveryErr != nil {
+			return false, false, nil, fmt.Errorf("reconcile expired durable replay: %w", recoveryErr)
+		}
+		execution.DeliveryReplayCursor = projected
+		return false, false, nil, errDeliveryReplayReconciled
+	}
 	if err != nil {
 		return false, false, nil, fmt.Errorf("admit durable agent event: %w", err)
 	}
@@ -582,24 +700,28 @@ func (sm *StreamManager) projectCanonicalAgentEvent(
 	durableEvent *models.AgentDeliveryEvent,
 	delivery AgentDeliveryRepository,
 	client *agentctl.Client,
-) (agentctl.AgentEvent, bool, error) {
+	scheduleAcknowledgement bool,
+) (agentctl.AgentEvent, bool, bool, error) {
 	if delivery == nil || !canonicalAgentDeliveryEvent(event) {
-		return event, false, nil
+		return event, false, true, nil
 	}
 	if event.DeliveryStreamID == "" || event.DeliverySequence == 0 {
-		return event, false, nil
+		return event, false, true, nil
 	}
 	if durableEvent == nil {
 		durableEvent = durableAgentEvent(execution, event)
 	}
 	projector, ok := delivery.(canonicalAgentDeliveryProjector)
 	if !ok {
+		if event.Type == streams.EventTypeShellOutputUpdate {
+			return event, false, false, ErrDeliveryRecoveryBlocked
+		}
 		sm.logger.Debug("canonical agent delivery projector is unavailable; using legacy projection",
 			zap.String("instance_id", execution.ID),
 			zap.String("event_type", event.Type))
-		return event, false, nil
+		return event, false, true, nil
 	}
-	isAppend, err := projector.ProjectCanonicalAgentDeliveryEvent(
+	projectionResult, err := projector.ProjectCanonicalAgentDeliveryEvent(
 		ctx, durableEvent, deliveryEffectForEvent(event),
 	)
 	if err != nil {
@@ -607,15 +729,30 @@ func (sm *StreamManager) projectCanonicalAgentEvent(
 			zap.String("instance_id", execution.ID),
 			zap.String("event_type", event.Type),
 			zap.Error(err))
-		return event, false, err
+		return event, false, false, err
 	}
-	event.CanonicalMessageID = canonicalAgentMessageID(execution, event)
+	notify := true
+	if event.Type == streams.EventTypeShellOutputUpdate || canonicalShellStartEvent(event) {
+		event, err = committedShellProjectionEvent(ctx, delivery, event, durableEvent.SessionID)
+		if err != nil {
+			return event, false, false, err
+		}
+		if event.Type == streams.EventTypeToolCall {
+			event.CanonicalMessageAppend = projectionResult.Appended
+		}
+	} else {
+		event.CanonicalMessageBaseID = canonicalAgentMessageID(execution, event)
+		event.CanonicalMessageID = projectionResult.CanonicalMessageID
+		event.CanonicalMessageAppend = projectionResult.Appended
+		notify = canonicalProjectionShouldNotify(event, projectionResult)
+	}
 	event.CanonicalProjection = true
-	event.CanonicalMessageAppend = isAppend
 	// Projection is the canonical commit boundary. ACK transport is scheduled
 	// independently so a lost ACK cannot hide output that is already durable.
-	sm.scheduleDurableDeliveryAck(client, event)
-	return event, true, nil
+	if scheduleAcknowledgement {
+		sm.scheduleDurableDeliveryAck(execution, client, event)
+	}
+	return event, true, notify, nil
 }
 
 // projectCanonicalAgentEvents applies one contiguous compatible batch before
@@ -632,6 +769,9 @@ func (sm *StreamManager) projectCanonicalAgentEvents(
 	if len(prepared) == 0 {
 		return nil
 	}
+	if prepared[0].event.Type == streams.EventTypeShellOutputUpdate || prepared[0].event.Type == streams.EventTypeToolCall {
+		return sm.projectCanonicalAgentEventsIndividually(ctx, execution, prepared, delivery, client, startupGeneration)
+	}
 	projector, ok := delivery.(canonicalAgentDeliveryBatchProjector)
 	if !ok {
 		return sm.projectCanonicalAgentEventsIndividually(
@@ -643,14 +783,14 @@ func (sm *StreamManager) projectCanonicalAgentEvents(
 	if err != nil {
 		return err
 	}
-	appendMessages, err := projector.ProjectCanonicalAgentDeliveryEvents(ctx, events, effects)
+	projectionResults, err := projector.ProjectCanonicalAgentDeliveryEvents(ctx, events, effects)
 	if err != nil {
 		return err
 	}
-	if len(appendMessages) != len(prepared) {
-		return fmt.Errorf("canonical delivery projector returned %d results for %d events", len(appendMessages), len(prepared))
+	if len(projectionResults) != len(prepared) {
+		return fmt.Errorf("canonical delivery projector returned %d results for %d events", len(projectionResults), len(prepared))
 	}
-	sm.notifyCanonicalAgentEventBatch(execution, prepared, appendMessages, client, startupGeneration)
+	sm.notifyCanonicalAgentEventBatch(execution, prepared, projectionResults, client, startupGeneration)
 	return nil
 }
 
@@ -663,13 +803,13 @@ func (sm *StreamManager) projectCanonicalAgentEventsIndividually(
 	startupGeneration uint64,
 ) error {
 	for _, item := range prepared {
-		event, _, err := sm.projectCanonicalAgentEvent(
-			ctx, execution, item.event, item.durableEvent, delivery, client,
+		event, _, notify, err := sm.projectCanonicalAgentEvent(
+			ctx, execution, item.event, item.durableEvent, delivery, client, true,
 		)
 		if err != nil {
 			return err
 		}
-		if !item.skipCallback {
+		if notify && !item.skipCallback {
 			sm.notifyAgentEvent(execution, event, startupGeneration)
 		}
 	}
@@ -694,7 +834,7 @@ func canonicalDeliveryBatchInputs(
 func (sm *StreamManager) notifyCanonicalAgentEventBatch(
 	execution *AgentExecution,
 	prepared []preparedAgentEvent,
-	appendMessages []bool,
+	projectionResults []models.CanonicalAgentDeliveryProjectionResult,
 	client *agentctl.Client,
 	startupGeneration uint64,
 ) {
@@ -703,11 +843,12 @@ func (sm *StreamManager) notifyCanonicalAgentEventBatch(
 	var content strings.Builder
 	for i, item := range prepared {
 		event := item.event
-		event.CanonicalMessageID = canonicalAgentMessageID(execution, event)
+		event.CanonicalMessageBaseID = canonicalAgentMessageID(execution, event)
+		event.CanonicalMessageID = projectionResults[i].CanonicalMessageID
 		event.CanonicalProjection = true
-		event.CanonicalMessageAppend = appendMessages[i]
-		sm.scheduleDurableDeliveryAck(client, event)
-		if item.skipCallback {
+		event.CanonicalMessageAppend = projectionResults[i].Appended
+		sm.scheduleDurableDeliveryAck(execution, client, event)
+		if item.skipCallback || !canonicalProjectionShouldNotify(event, projectionResults[i]) {
 			continue
 		}
 		if !notify {
@@ -730,6 +871,16 @@ func (sm *StreamManager) notifyCanonicalAgentEventBatch(
 	}
 }
 
+func canonicalProjectionShouldNotify(
+	event agentctl.AgentEvent,
+	result models.CanonicalAgentDeliveryProjectionResult,
+) bool {
+	if event.Type != streams.EventTypeMessageChunk && event.Type != streams.EventTypeReasoning {
+		return true
+	}
+	return result.CanonicalMessageID != ""
+}
+
 // durableAgentEventIdentity distinguishes a genuine legacy event from a
 // malformed event from an execution that already negotiated retained
 // delivery. Legacy callbacks must remain usable when a repository is present,
@@ -737,6 +888,12 @@ func (sm *StreamManager) notifyCanonicalAgentEventBatch(
 func durableAgentEventIdentity(execution *AgentExecution, event agentctl.AgentEvent) (bool, error) {
 	complete := event.DeliveryStreamID != "" && event.DeliverySequence > 0
 	if complete {
+		if execution == nil || execution.DeliveryMode != DurableDeliveryV1 || execution.DeliveryStreamID == "" ||
+			execution.DeliveryStreamID != event.DeliveryStreamID || execution.DeliveryIncarnationID == "" ||
+			execution.DeliveryIncarnationID != event.DeliveryIncarnationID || execution.DeliveryHarnessGeneration == 0 ||
+			execution.DeliveryHarnessGeneration != event.DeliveryHarnessGeneration {
+			return false, ErrDurableAdoptionIdentityMismatch
+		}
 		return true, nil
 	}
 	partial := event.DeliveryStreamID != "" ||
@@ -974,6 +1131,9 @@ func (sm *StreamManager) connectWorkspaceStream(execution *AgentExecution, ready
 
 		// Signal that workspace stream is ready
 		signalReady()
+		advisoryCtx, advisoryCancel := context.WithCancel(ctx)
+		sm.startRuntimeStorageAdvisoryWithContext(advisoryCtx, execution)
+		defer advisoryCancel()
 
 		// Wait for the stream to close. Also exits on Manager shutdown / Wait
 		// so the goroutine drains when the remote end keeps the connection

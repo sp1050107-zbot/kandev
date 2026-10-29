@@ -60,9 +60,12 @@ test.describe("Setup recovery UX (desktop)", () => {
         return;
       }
       await route.fulfill({
-        status: 500,
+        status: 400,
         contentType: "application/json",
-        body: JSON.stringify({ error: "Invalid repository configuration" }),
+        body: JSON.stringify({
+          error: "Invalid repository configuration",
+          error_code: "quick_chat_creation_rejected",
+        }),
       });
     });
 
@@ -249,7 +252,7 @@ test.describe("Setup recovery UX (desktop)", () => {
     ).toBeVisible();
     await expect(
       dialog.getByTestId("session-recovery-action-message").getByTestId("recovery-resume-button"),
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible({ timeout: 30_000 });
     const sessions = (await apiClient.listTaskSessions(created.task_id)).sessions;
     expect(sessions).toHaveLength(1);
     expect(sessions[0].id).toBe(created.session_id);

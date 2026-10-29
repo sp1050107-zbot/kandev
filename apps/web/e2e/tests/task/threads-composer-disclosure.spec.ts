@@ -22,6 +22,73 @@ import {
 
 let original: ThreadPresentationSettings;
 
+for (const layout of ["grid", "columns"] as const) {
+  test(`expands a required question within the ${layout} tile budget and retains the transcript floor`, async ({
+    testPage,
+    apiClient,
+    seedData,
+  }, testInfo) => {
+    test.setTimeout(180_000);
+    await testPage.setViewportSize({ width: 1366, height: 1100 });
+    const { task } = await seedLongThreadQuestion(apiClient, seedData);
+    await seedThreadPresentation(apiClient, { layout, autoHideComposer: true });
+    await testPage.goto(`/threads?taskId=${task.id}`);
+
+    const board = testPage.getByTestId("threads-board");
+    const tile = testPage.getByTestId(`thread-column-${task.id}`);
+    const container = tile.getByTestId("clarification-overlay-container");
+    const transcript = tile.locator(".chat-message-list");
+    await expect(board).toHaveAttribute("data-layout", layout);
+    await expect(tile.getByTestId("clarification-option")).toHaveCount(3, {
+      timeout: 30_000,
+    });
+    await expect(container).toBeVisible();
+    await expect
+      .poll(() => transcript.evaluate((el) => el.getBoundingClientRect().height))
+      .toBeGreaterThanOrEqual(79);
+
+    const geometry = await container.evaluate((element) => ({
+      hostMax: Number((element as HTMLElement).dataset.hostMaxHeight),
+      maxHeight: Number.parseFloat((element as HTMLElement).style.maxHeight),
+      viewportHeight: window.innerHeight,
+    }));
+    const initialCap = Math.round(geometry.viewportHeight * 0.5);
+    expect(geometry.hostMax).toBeGreaterThan(0);
+    expect(geometry.maxHeight).toBe(Math.min(initialCap, geometry.hostMax));
+    const expand = tile.getByTestId("clarification-panel-expand");
+    const reset = tile.getByTestId("clarification-panel-reset");
+    if (geometry.hostMax > initialCap) {
+      await expect(expand).toBeEnabled();
+      await expand.click();
+      await expect(container).toHaveCSS("height", `${geometry.hostMax}px`);
+      await expect(container).toHaveCSS("max-height", `${geometry.hostMax}px`);
+      await expect(reset).toBeEnabled();
+    } else {
+      await expect(expand).toBeDisabled();
+      await expect(container).toHaveCSS("max-height", `${geometry.hostMax}px`);
+      await expect(reset).toBeDisabled();
+    }
+    await expect
+      .poll(() => transcript.evaluate((el) => el.getBoundingClientRect().height))
+      .toBeGreaterThanOrEqual(79);
+    await expect(tile.getByTestId("chat-input-editor")).toBeVisible();
+    await testInfo.attach(`threads-${layout}-clarification-expanded.png`, {
+      body: await testPage.screenshot(),
+      contentType: "image/png",
+    });
+
+    if (geometry.hostMax > initialCap) {
+      await reset.click();
+      await expect
+        .poll(() => container.evaluate((el) => (el as HTMLElement).style.height))
+        .toBe("");
+    }
+    await expect
+      .poll(() => transcript.evaluate((el) => el.getBoundingClientRect().height))
+      .toBeGreaterThanOrEqual(79);
+  });
+}
+
 for (const zoom of [1, 0.9]) {
   for (const autoHideComposer of [false, true]) {
     // @covers AC-UI-THREADS-DECK-005.5, AC-UI-THREADS-DECK-005.6, AC-UI-THREADS-DECK-004.1
@@ -35,7 +102,11 @@ for (const zoom of [1, 0.9]) {
       await apiClient.seedAgentMessages(task.session_id!, 35, "Question history");
       await seedThreadPresentation(apiClient, { layout: "grid", autoHideComposer });
       await withNativeThreadZoom(backend.frontendUrl, zoom, testInfo, async (page) => {
+        const messagesLoaded = watchWs(page).waitForResponse("message.list", {
+          requestWhere: (payload) => payload.session_id === task.session_id,
+        });
         await page.goto(`/threads?taskId=${task.id}`);
+        await messagesLoaded;
         const board = page.getByTestId("threads-board");
         const tile = page.getByTestId(`thread-column-${task.id}`);
         await expect(board).toHaveAttribute("data-layout", "grid");
@@ -237,8 +308,8 @@ test("hides the whole composer except CI and preserves drafts through hover and 
 }, testInfo) => {
   test.setTimeout(180_000);
   await testPage.setViewportSize({ width: 1440, height: 1100 });
-  const task = await startPresentationThread(testPage, apiClient, seedData, "A disclosure");
-  const sibling = await startPresentationThread(testPage, apiClient, seedData, "B disclosure");
+  const task = await startPresentationThread(apiClient, seedData, "A disclosure");
+  const sibling = await startPresentationThread(apiClient, seedData, "B disclosure");
   await apiClient.mockGitHubAssociateTaskPR({
     task_id: task.id,
     workspace_id: seedData.workspaceId,
@@ -302,12 +373,7 @@ test("reveals and collapses immediately with reduced motion", async ({
   seedData,
 }) => {
   await testPage.emulateMedia({ reducedMotion: "reduce" });
-  const task = await startPresentationThread(
-    testPage,
-    apiClient,
-    seedData,
-    "Reduced motion composer",
-  );
+  const task = await startPresentationThread(apiClient, seedData, "Reduced motion composer");
   await seedThreadPresentation(apiClient, { layout: "columns", autoHideComposer: true });
   await testPage.mouse.move(0, 0);
   await testPage.goto("/threads");
@@ -339,13 +405,8 @@ test("preserves history and bottom following while the footer changes height", a
 }) => {
   test.setTimeout(180_000);
   await testPage.setViewportSize({ width: 1250, height: 1000 });
-  const task = await startPresentationThread(
-    testPage,
-    apiClient,
-    seedData,
-    "A anchored transcript",
-  );
-  await startPresentationThread(testPage, apiClient, seedData, "B stable sibling");
+  const task = await startPresentationThread(apiClient, seedData, "A anchored transcript");
+  await startPresentationThread(apiClient, seedData, "B stable sibling");
   await apiClient.seedAgentMessages(task.session_id!, 35, "History marker");
   await seedThreadPresentation(apiClient, { layout: "grid", autoHideComposer: true });
   await testPage.mouse.move(0, 0);
@@ -467,12 +528,7 @@ test("preserves a rejected draft and native cancellation feedback after retry", 
   seedData,
 }) => {
   test.setTimeout(120_000);
-  const task = await startPresentationThread(
-    testPage,
-    apiClient,
-    seedData,
-    "Recoverable composer send",
-  );
+  const task = await startPresentationThread(apiClient, seedData, "Recoverable composer send");
   let reject = true;
   let rejected = 0;
   await testPage.routeWebSocket(/\/ws$/, (socket) => {
@@ -527,18 +583,23 @@ test("keeps the native model picker and attachment-only draft available after po
   seedData,
 }) => {
   const ws = watchWs(testPage);
-  const task = await startPresentationThread(testPage, apiClient, seedData, "Composer controls");
+  const task = await startPresentationThread(apiClient, seedData, "Composer controls");
   await apiClient.seedAgentMessages(task.session_id!, 1, "Composer controls readiness");
   await seedThreadPresentation(apiClient, { layout: "columns", autoHideComposer: true });
+  await testPage.mouse.move(0, 0);
   await testPage.goto("/threads");
   await expect(testPage.getByTestId("threads-board")).toBeVisible({ timeout: 15_000 });
   const tile = testPage.getByTestId(`thread-column-${task.id}`);
   await expect(tile).toBeVisible({ timeout: 15_000 });
   const editor = tile.getByTestId("chat-input-editor");
+  await expect(tile.getByTestId("session-chat")).toBeVisible();
+  await expect(editor).toHaveCount(1);
+  await expect(editor).toBeHidden();
   await expect(
     tile.locator(".chat-message-list").getByText("Composer controls readiness 1", { exact: true }),
   ).toBeVisible();
   await tile.locator("header").hover();
+  await expect(editor).toBeVisible();
   const model = tile.getByRole("button", { name: "Session model settings" });
   await expect(model).toBeVisible();
   await model.click();
