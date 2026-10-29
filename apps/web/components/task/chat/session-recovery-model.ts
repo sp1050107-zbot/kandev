@@ -23,6 +23,8 @@ import {
 import { interruptionRecoveryKey } from "./messages/interruption-recovery-feedback";
 import { managedRuntimeStartupCopy } from "./managed-runtime-startup-copy";
 import { useOptionalAppStore } from "@/components/state-provider";
+import { storageCauseFromError } from "@/lib/session-delivery-storage";
+import { storageFailureCopy, storageRecoveryDetailFields } from "./session-storage-recovery";
 
 type RecoveryCopy = { title: string; summary: string; showSummary: boolean };
 
@@ -63,6 +65,14 @@ export function recoveryCopy(
   model: ActiveSessionRecovery,
   t: ReturnType<typeof useTranslation>["t"],
 ) {
+  const storageCause = storageCauseFromError(model.error);
+  if (storageCause) return storageFailureCopy(storageCause, model.error, t);
+  if (model.kind === "delivery_history_gap")
+    return {
+      title: t("task:deliveryHistoryGapTitle"),
+      summary: t("task:deliveryHistoryGapBody"),
+      showSummary: true,
+    };
   if (model.kind === "recovery_inspection_busy")
     return {
       title: t("task:launchNeedsAttention"),
@@ -305,7 +315,10 @@ export function useRecoveryPresentation(
   const { busy, busyAction } = recoveryPresentationBusy(model, automatic, actions);
   const causes = recoveryPresentationCauses(model, bootstrap, automatic, t);
   const details = recoveryPresentationDetails(model, bootstrap, causes, actions, t);
-  const detailFields = bootstrap?.detailFields ?? [];
+  const detailFields = [
+    ...(bootstrap?.detailFields ?? []),
+    ...storageRecoveryDetailFields(storageCauseFromError(model.error), t),
+  ];
   const failure = recoveryFailureCopy(actions, t);
   return {
     copy: withAutomaticNotice(copy, automatic, actions),
@@ -389,7 +402,11 @@ function withAutomaticNotice(
   actions: SessionRecoveryActions,
 ) {
   const notice = actions.recoveryNotice ?? automatic?.notice;
-  return notice && !actions.recoveryError && !copy.hasTypedSelectionCause
+  const noticeKind = actions.recoveryNotice ? actions.recoveryNoticeKind : automatic?.noticeKind;
+  return notice &&
+    !actions.recoveryError &&
+    !copy.hasTypedSelectionCause &&
+    (!copy.hasTypedCleanupCause || noticeKind === "inspection_busy")
     ? { ...copy, summary: notice }
     : copy;
 }
@@ -434,6 +451,7 @@ function recoveryPresentationCopy(
     return {
       ...recoveryCopy({ ...model, kind: "managed_clone_relocation_required" }, t),
       hasTypedSelectionCause: false,
+      hasTypedCleanupCause: false,
       noPromptSent: false,
       freshStartWarning: false,
       workspaceStatus: null,
@@ -444,6 +462,7 @@ function recoveryPresentationCopy(
       summary: bootstrap.summary,
       showSummary: bootstrap.showSummary,
       hasTypedSelectionCause: bootstrap.hasTypedSelectionCause,
+      hasTypedCleanupCause: bootstrap.hasTypedCleanupCause,
       noPromptSent: bootstrap.noPromptSent,
       freshStartWarning: bootstrap.freshStartWarning,
       workspaceStatus: bootstrap.workspaceStatus,
@@ -451,6 +470,7 @@ function recoveryPresentationCopy(
   return {
     ...recoveryCopy(model, t),
     hasTypedSelectionCause: false,
+    hasTypedCleanupCause: false,
     noPromptSent: false,
     freshStartWarning: false,
     workspaceStatus: null,
@@ -464,7 +484,7 @@ function recoveryPresentationDetails(
   actions: SessionRecoveryActions,
   t: ReturnType<typeof useTranslation>["t"],
 ) {
-  if (bootstrap?.hasTypedSelectionCause) return "";
+  if (bootstrap?.hasTypedSelectionCause || bootstrap?.hasTypedCleanupCause) return "";
   const manualFailure = actions.manualRecoveryFailure;
   const ownsManualFailure =
     !manualFailure ||

@@ -74,6 +74,7 @@ and repository-context identity.
 - [Diagnostic logging](requirements/diagnostic-logging.md)
 - [Runtime failure attribution](requirements/runtime-failure-attribution.md)
 - [Durable agent delivery](requirements/durable-agent-delivery.md) (draft)
+- [Durable agent text segmentation](requirements/durable-agent-text-segmentation.md) (draft)
 - [Duration-aware E2E sharding and CI reliability](requirements/e2e-duration-aware-sharding.md)
 - [External CI runner capacity](requirements/external-e2e-runner-capacity.md)
 - [Expected runtime log severity](requirements/expected-runtime-log-severity.md)
@@ -100,6 +101,7 @@ and repository-context identity.
 - [Quiet benign teardown log noise on shutdown](requirements/shutdown-log-noise.md)
 - [Do not surface backend-shutdown turn aborts as agent failures](requirements/shutdown-turn-failure-suppression.md)
 - [Background subsystem context-cancellation log severity](requirements/shutdown-background-canceled-logs.md)
+- [SQLite File Hygiene](requirements/sqlite-file-hygiene.md)
 - [Startup Configuration Parity](requirements/startup-configuration-parity.md)
 - [Prevent Host Sleep During Active Tasks](requirements/task-sleep-inhibition.md)
 - [Traditional Chinese locales (Taiwan and Hong Kong)](requirements/traditional-chinese-locales.md)
@@ -147,6 +149,7 @@ and repository-context identity.
 - [Provider Response-Attempt Recovery](system-design/provider-response-attempt-recovery.md)
 - [Workspace Git Status](system-design/workspace-git-status.md)
 - [Go dev launcher and startup version](system-design/go-dev-launcher.md)
+- [SQLite File Hygiene](system-design/sqlite-file-hygiene.md)
 - [Startup database selection continuity](system-design/startup-database-selection-continuity.md)
 - [Background subsystem context-cancellation log severity](system-design/shutdown-background-canceled-logs.md)
 

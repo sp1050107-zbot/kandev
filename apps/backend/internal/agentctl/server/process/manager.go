@@ -27,12 +27,15 @@ import (
 	"github.com/kandev/kandev/internal/agentctl/server/shell"
 	"github.com/kandev/kandev/internal/agentctl/server/utility"
 	"github.com/kandev/kandev/internal/agentctl/types"
+	"github.com/kandev/kandev/internal/agentctl/types/deliverylimits"
 	"github.com/kandev/kandev/internal/agentctl/types/streams"
+	"github.com/kandev/kandev/internal/common/launchwrapper"
 	"github.com/kandev/kandev/internal/common/logger"
 	"github.com/kandev/kandev/internal/common/mcpmode"
 	"github.com/kandev/kandev/internal/common/securityutil"
 	"github.com/kandev/kandev/internal/gitconfigenv"
 	"github.com/kandev/kandev/internal/githubauth"
+	systemmetrics "github.com/kandev/kandev/internal/system/metrics"
 	tools "github.com/kandev/kandev/internal/tools/installer"
 	"go.uber.org/zap"
 )
@@ -112,25 +115,50 @@ const processStderrDrainTimeout = time.Second
 
 // Manager manages the agent subprocess
 type Manager struct {
-	cfg             *config.InstanceConfig
-	logger          *logger.Logger
-	managedGitTools installedManagedGitTools
+	questionImageWorkDir     string
+	questionImageOnce        sync.Once
+	questionImageSlots       chan struct{}
+	cfg                      *config.InstanceConfig
+	logger                   *logger.Logger
+	managedGitTools          installedManagedGitTools
+	materializeGitHelperPath string
 
 	// deliveryJournal is opened before any agent process starts. A configured
 	// but unreadable journal is an admission error, never a legacy fallback.
-	deliveryJournal            *journal.Journal
-	deliveryJournalErr         error
-	deliveryWriter             *deliveryEventWriter
-	deliveryJournalMu          sync.RWMutex
-	deliveryJournalClose       sync.Once
-	deliveryJournalCloseErr    error
-	deliveryWakeOnce           sync.Once
-	deliveryWakeCh             chan struct{}
-	deliverySubmissionMu       sync.Mutex
-	deliveryActiveMu           sync.RWMutex
-	deliveryActiveID           string
-	deliveryPromptMu           sync.Mutex
-	deliveryPromptByGeneration map[uint64]string
+	deliveryJournal             *journal.Journal
+	deliveryJournalErr          error
+	deliveryLimit               int64
+	deliveryWriter              *deliveryEventWriter
+	shellDeliveryMu             sync.Mutex
+	shellDelivery               map[shellDeliveryKey]shellDeliveryBaseline
+	deliveryJournalMu           sync.RWMutex
+	deliveryJournalClose        sync.Once
+	deliveryJournalCloseErr     error
+	deliveryWakeOnce            sync.Once
+	deliveryWakeCh              chan struct{}
+	deliverySubmissionMu        sync.Mutex
+	deliveryActiveMu            sync.RWMutex
+	deliveryActiveID            string
+	deliveryHealth              DeliveryHealth
+	deliveryFailureRevision     atomic.Uint64
+	deliveryFailedSubmissionID  string
+	deliveryFailureDrain        time.Duration
+	deliveryPausedWriters       int
+	deliveryBlocked             bool
+	deliveryPressureCancelledID string
+	deliveryPressureTerminalID  string
+	deliveryCancellationFailed  bool
+	deliveryPromptMu            sync.Mutex
+	deliveryPromptByGeneration  map[uint64]string
+
+	// diskSampler is the process-wide advisory capacity cache shared by every
+	// instance. Nil falls back to a direct bounded read on the advisory route.
+	diskSampler   *systemmetrics.DiskCapacitySampler
+	diskSamplerMu sync.RWMutex
+	// runtimeStorageCache is the last advisory snapshot produced by the
+	// dedicated route. Ordinary status reads it without filesystem I/O.
+	runtimeStorageCacheMu sync.RWMutex
+	runtimeStorageCache   *streams.RuntimeStorageSnapshot
 
 	// Process state
 	cmd                *exec.Cmd
@@ -155,6 +183,7 @@ type Manager struct {
 
 	// Workspace tracker for git status and file changes
 	workspaceTracker *WorkspaceTracker
+	passthrough      *PassthroughOwner
 	// repoTrackers holds per-repository trackers for multi-repo task roots.
 	// Each tracker stamps RepositoryName onto its emitted events and shares
 	// subscriber channels with the root via the Manager fan-out.
@@ -291,6 +320,7 @@ type Manager struct {
 	// startOneShot store the freshly created channel here in the same place
 	// they assign stopCh itself.
 	stopChSnapshot atomic.Value // chan struct{}
+	shutdownIntent atomic.Pointer[atomic.Bool]
 	doneCh         chan struct{}
 	// attachedCount is the live count of backend event-stream connections
 	// (see attachment.go). Zero value correctly starts an instance detached.
@@ -423,6 +453,7 @@ func (m *Manager) BeginStop() {
 
 // NewManager creates a new process manager
 func NewManager(cfg *config.InstanceConfig, log *logger.Logger) *Manager {
+	imageWorkDir, _ := filepath.EvalSymlinks(cfg.WorkDir)
 	cfg.WorkDir = resolveExistingWorkDir(cfg.WorkDir, log.WithFields(zap.String("component", "process-manager")))
 	updatesChannelCapacity := cfg.DetachedEventLimit
 	if updatesChannelCapacity <= 0 {
@@ -430,9 +461,11 @@ func NewManager(cfg *config.InstanceConfig, log *logger.Logger) *Manager {
 	}
 	lifetimeCtx, lifetimeCancel := context.WithCancel(context.Background())
 	m := &Manager{
+		questionImageWorkDir:       imageWorkDir,
 		cfg:                        cfg,
 		logger:                     log.WithFields(zap.String("component", "process-manager")),
 		managedGitTools:            installedManagedGitToolsFromEnvironment(cfg.AgentEnv),
+		materializeGitHelperPath:   config.InstalledGitCredentialHelperPath(),
 		updatesCh:                  make(chan adapter.AgentEvent, updatesChannelCapacity),
 		pendingPermissions:         make(map[string]*PendingPermission),
 		lifetimeCtx:                lifetimeCtx,
@@ -443,6 +476,11 @@ func NewManager(cfg *config.InstanceConfig, log *logger.Logger) *Manager {
 	}
 	if cfg.DurableJournalPath != "" {
 		m.deliveryJournal, m.deliveryJournalErr = journal.Open(journal.Config{Path: cfg.DurableJournalPath})
+		if m.deliveryJournalErr == nil {
+			m.deliveryLimit = m.deliveryJournal.MaxEventBytes()
+			sessionID, incarnationID, generation := m.DeliverySubmissionIdentity()
+			m.deliveryJournalErr = m.deliveryJournal.ClassifyAbandonedDispatches(lifetimeCtx, sessionID, incarnationID, m.DeliveryStreamID(), generation)
+		}
 	}
 	// Build the root plus any immediate sibling repositories and recursively
 	// declared initialized submodules. The root remains a real empty-named
@@ -460,6 +498,7 @@ func NewManager(cfg *config.InstanceConfig, log *logger.Logger) *Manager {
 	m.shellMgr = shell.NewManager(cfg.WorkDir, log)
 	m.status.Store(StatusStopped)
 	m.exitCode.Store(-1)
+	m.passthrough = newPassthroughOwner(m)
 	return m
 }
 
@@ -518,12 +557,12 @@ func (m *Manager) deliveryJournalAvailable() bool {
 // peer; a configured journal failure is reported as unavailable instead.
 func (m *Manager) DeliveryCapability() journal.StorageCapability {
 	if m == nil || m.cfg == nil || m.cfg.DurableJournalPath == "" {
-		return journal.StorageCapability{Version: journal.CurrentVersion, Reason: "storage_not_durable"}
+		return journal.StorageCapability{Version: journal.CurrentProtocolVersion, Reason: "storage_not_durable"}
 	}
 	m.deliveryJournalMu.RLock()
 	defer m.deliveryJournalMu.RUnlock()
 	if m.deliveryJournalErr != nil || m.deliveryJournal == nil {
-		return journal.StorageCapability{Version: journal.CurrentVersion, Reason: "storage_unavailable"}
+		return journal.StorageCapability{Version: journal.CurrentProtocolVersion, Reason: "storage_unavailable"}
 	}
 	// Stream records are replayable and can be acknowledged by the connected
 	// backend while a session is starting. Only an unsettled prompt outcome
@@ -531,9 +570,10 @@ func (m *Manager) DeliveryCapability() journal.StorageCapability {
 	// unacknowledged stream records through the full descriptor.
 	unresolved, err := m.deliveryJournal.HasUnresolvedSubmissions(context.Background())
 	if err != nil {
-		return journal.StorageCapability{Version: journal.CurrentVersion, Reason: "storage_unavailable"}
+		return journal.StorageCapability{Version: journal.CurrentProtocolVersion, Reason: "storage_unavailable"}
 	}
-	return journal.StorageCapability{Version: journal.CurrentVersion, Durable: true, Unresolved: unresolved}
+	capability := journal.StorageCapability{Version: journal.CurrentProtocolVersion, Durable: true, Unresolved: unresolved}
+	return capability.WithLimits(m.deliveryJournal)
 }
 
 // DeliveryRecoveryDescriptor returns the authenticated instance's durable
@@ -658,6 +698,15 @@ func (m *Manager) AdmitDeliverySubmission(ctx context.Context, submission journa
 	if err != nil {
 		return journal.Submission{}, err
 	}
+	if err := m.refreshDeliveryPressure(ctx, deliveryJournal, ""); err != nil {
+		return journal.Submission{}, err
+	}
+	m.deliveryActiveMu.RLock()
+	blocked := m.deliveryBlocked
+	m.deliveryActiveMu.RUnlock()
+	if blocked {
+		return journal.Submission{}, errDeliveryPressure
+	}
 	if submission.StreamID == "" {
 		submission.StreamID = m.DeliveryStreamID()
 	}
@@ -678,7 +727,14 @@ func (m *Manager) DispatchDeliverySubmission(
 	}
 	m.deliverySubmissionMu.Lock()
 	defer m.deliverySubmissionMu.Unlock()
+	if err := m.refreshDeliveryPressure(ctx, deliveryJournal, ""); err != nil {
+		return journal.Submission{}, err
+	}
 	m.deliveryActiveMu.Lock()
+	if m.deliveryBlocked {
+		m.deliveryActiveMu.Unlock()
+		return journal.Submission{}, errDeliveryPressure
+	}
 	m.deliveryActiveID = id
 	m.deliveryActiveMu.Unlock()
 	defer func() {
@@ -686,7 +742,8 @@ func (m *Manager) DispatchDeliverySubmission(
 		m.deliveryActiveID = ""
 		m.deliveryActiveMu.Unlock()
 	}()
-	return (&SubmissionDelivery{Journal: deliveryJournal}).Dispatch(ctx, id, call)
+	stopping := m.shutdownIntent.Load()
+	return (&SubmissionDelivery{Journal: deliveryJournal, Stopping: stopping}).Dispatch(ctx, id, call)
 }
 
 func (m *Manager) activeDeliverySubmissionID() string {
@@ -756,11 +813,11 @@ func (m *Manager) RetireDeliverySubmission(ctx context.Context, id string, recov
 	if err != nil {
 		return err
 	}
-	if submission.State == journal.SubmissionInterruptedUnknown || recoveryGeneration == submission.HarnessGeneration {
-		sessionID, incarnationID, generation := m.DeliverySubmissionIdentity()
-		if submission.SessionID != sessionID || submission.IncarnationID != incarnationID || recoveryGeneration != generation {
-			return journal.ErrOwnerMismatch
-		}
+	sessionID, incarnationID, generation := m.DeliverySubmissionIdentity()
+	if submission.SessionID != sessionID || submission.IncarnationID != incarnationID ||
+		generation != recoveryGeneration || submission.HarnessGeneration > generation ||
+		(submission.HarnessGeneration == generation && !journal.HasUnprovenOutcome(submission)) {
+		return journal.ErrOwnerMismatch
 	}
 	_, err = deliveryJournal.RetireSubmission(ctx, id, recoveryGeneration)
 	return err
@@ -1137,9 +1194,14 @@ func (m *Manager) StartAllWorkspaceTrackers(ctx context.Context) {
 	}
 }
 
-// stopWorkspaceTrackers stops root + per-repo trackers (idempotent via sync.Once).
+// stopWorkspaceTrackers stops root, per-repo, and lazy trackers idempotently.
 func (m *Manager) stopWorkspaceTrackers() {
 	root, trackers := m.snapshotTrackers()
+	m.workspaceTrackersMu.Lock()
+	for _, tracker := range m.workspaceTrackersBySubpath {
+		trackers = append(trackers, tracker)
+	}
+	m.workspaceTrackersMu.Unlock()
 	if root != nil {
 		root.Stop()
 	}
@@ -1724,6 +1786,9 @@ func (m *Manager) StartWithGeneration(ctx context.Context) (uint64, error) {
 		return 0, err
 	}
 	defer release()
+	if m.passthrough.Live() {
+		return 0, fmt.Errorf("passthrough agent is already running")
+	}
 
 	if m.Status() == StatusRunning || m.Status() == StatusStarting {
 		return 0, fmt.Errorf("agent is already running")
@@ -1787,6 +1852,9 @@ func (m *Manager) startManagedProcess() (uint64, error) {
 	if err := m.cmd.Start(); err != nil {
 		_ = m.closeStderrPipe()
 		m.status.Store(StatusError)
+		if !m.cfg.LaunchWrapper.IsZero() {
+			return 0, errors.New("wrapped agent process failed to start")
+		}
 		return 0, formatAgentStartError(err, m.cfg.AgentEnv)
 	}
 	processGeneration := m.beginManagedStartupGeneration()
@@ -1806,6 +1874,7 @@ func (m *Manager) startManagedProcess() (uint64, error) {
 	m.stopChSnapshot.Store(m.stopCh)
 	m.doneCh = make(chan struct{})
 	m.stopChClosed.Store(false)
+	m.shutdownIntent.Store(&atomic.Bool{})
 
 	// Connect adapter to the process stdin/stdout pipes
 	if err := m.adapter.Connect(m.stdin, m.stdout); err != nil {
@@ -1854,6 +1923,11 @@ func (m *Manager) startManagedProcess() (uint64, error) {
 // startOneShot initialises a one-shot adapter without spawning a long-lived subprocess.
 // The adapter manages its own per-prompt subprocess lifecycle internally.
 func (m *Manager) startOneShot() error {
+	m.cfg.AgentEnv = launchwrapper.StripControlCredentials(m.cfg.AgentEnv)
+	if err := m.prepareOneShotArgs(); err != nil {
+		m.status.Store(StatusError)
+		return err
+	}
 	if m.adapterCfg != nil && m.adapterCfg.OneShotConfig != nil {
 		m.adapterCfg.OneShotConfig.Env = m.cfg.AgentEnv
 	}
@@ -1862,6 +1936,7 @@ func (m *Manager) startOneShot() error {
 	m.stopChSnapshot.Store(m.stopCh)
 	m.doneCh = make(chan struct{})
 	m.stopChClosed.Store(false)
+	m.shutdownIntent.Store(&atomic.Bool{})
 
 	// Forward adapter updates to our channel
 	m.wg.Add(1)
@@ -1890,16 +1965,18 @@ func (m *Manager) buildAdapterConfig() error {
 		return fmt.Errorf("resolve MCP servers for agent session: %w", err)
 	}
 	m.adapterCfg = &adapter.Config{
-		WorkDir:                   m.cfg.WorkDir,
-		AutoApprove:               m.adapterAutoApprove(),
-		McpServers:                mcpServers,
-		AgentID:                   m.cfg.AgentType, // From registry (e.g., "auggie", "amp", "claude-code")
-		AssumeMcpSse:              m.cfg.AssumeMcpSse,
-		AssumeMcpHttp:             m.cfg.AssumeMcpHttp,
-		RequiresProcessKill:       m.cfg.RequiresProcessKill,
-		NotificationQueueCapacity: m.cfg.NotificationQueueCapacity,
-		PromptCancelJoinTimeout:   m.cfg.PromptCancelJoinTimeout,
-		ProviderGatewayAuth:       m.cfg.ProviderGatewayAuth,
+		WorkDir:                    m.cfg.WorkDir,
+		AutoApprove:                m.adapterAutoApprove(),
+		McpServers:                 mcpServers,
+		AgentID:                    m.cfg.AgentType, // From registry (e.g., "auggie", "amp", "claude-code")
+		AssumeMcpSse:               m.cfg.AssumeMcpSse,
+		AssumeMcpHttp:              m.cfg.AssumeMcpHttp,
+		RequiresProcessKill:        m.cfg.RequiresProcessKill,
+		NotificationQueueCapacity:  m.cfg.NotificationQueueCapacity,
+		AgentBackgroundWorkEnabled: m.cfg.AgentBackgroundWorkEnabled,
+		PromptCancelJoinTimeout:    m.cfg.PromptCancelJoinTimeout,
+		ProviderGatewayAuth:        m.cfg.ProviderGatewayAuth,
+		PromptSuggestions:          m.cfg.PromptSuggestions,
 	}
 
 	// Configure one-shot mode when a continue command is provided.
@@ -1962,32 +2039,23 @@ func (m *Manager) buildFinalCommand() error {
 	cmdArgs = append(cmdArgs, m.cfg.AgentArgs[1:]...)
 	cmdArgs = append(cmdArgs, extraArgs...)
 
-	finalArgs := append([]string{m.cfg.AgentArgs[0]}, cmdArgs...)
-	if err := managedruntime.PrepareNPMProjectPrefix(finalArgs); err != nil {
-		return errors.New("managed npm project prefix could not be prepared")
+	m.cfg.AgentEnv = launchwrapper.StripControlCredentials(m.cfg.AgentEnv)
+	finalArgs, err := m.prepareSessionArgs(append([]string{m.cfg.AgentArgs[0]}, cmdArgs...))
+	if err != nil {
+		return err
+	}
+	if err := m.prepareOneShotArgs(); err != nil {
+		return err
 	}
 	m.finalCommand = strings.Join(finalArgs, " ")
-	cmdArgs = finalArgs[1:]
-	if m.adapterCfg != nil && m.adapterCfg.OneShotConfig != nil {
-		oneShot := m.adapterCfg.OneShotConfig
-		oneShot.InitialArgs = append([]string(nil), oneShot.InitialArgs...)
-		oneShot.ContinueArgs = append([]string(nil), oneShot.ContinueArgs...)
-		if err := managedruntime.PrepareNPMProjectPrefix(oneShot.InitialArgs); err != nil {
-			return errors.New("managed npm project prefix could not be prepared")
-		}
-		if err := managedruntime.PrepareNPMProjectPrefix(oneShot.ContinueArgs); err != nil {
-			return errors.New("managed npm project prefix could not be prepared")
-		}
+	if !m.cfg.LaunchWrapper.IsZero() {
+		m.finalCommand = "[wrapped agent]"
 	}
-
-	m.logger.Debug("final agent command",
-		zap.String("binary", m.cfg.AgentArgs[0]),
-		zap.Strings("args", cmdArgs),
-		zap.Int("extra_args_count", len(extraArgs)))
+	cmdArgs = finalArgs[1:]
 
 	// NOTE: We intentionally don't use exec.CommandContext here because we don't want
 	// the HTTP request context to kill the agent process when the request completes.
-	m.cmd = exec.Command(m.cfg.AgentArgs[0], cmdArgs...)
+	m.cmd = exec.Command(finalArgs[0], cmdArgs...)
 	m.cmd.Dir = m.cfg.WorkDir
 	m.cmd.Env = m.cfg.AgentEnv
 	// Create a new process group so we can kill all child processes together.
@@ -2219,19 +2287,19 @@ func lookupEnvValue(env []string, key string) string {
 // Configure sets the agent command and optional environment variables.
 // This must be called before Start() if the instance was created without a command.
 // continueCommand is optional — when set, the adapter uses it for one-shot follow-up prompts.
-func (m *Manager) Configure(command string, agentArgs []string, agentArgsPresent bool, env map[string]string, continueCommand string, continueArgs []string, continueArgsPresent bool) error {
-	return m.configure(command, agentArgs, agentArgsPresent, env, continueCommand, continueArgs, continueArgsPresent, false)
+func (m *Manager) Configure(command string, agentArgs []string, agentArgsPresent bool, env map[string]string, continueCommand string, continueArgs []string, continueArgsPresent bool, wrapper ...launchwrapper.Spec) error {
+	return m.configure(command, agentArgs, agentArgsPresent, env, continueCommand, continueArgs, continueArgsPresent, false, wrapper...)
 }
 
 // ConfigureWithEnvironment sets the agent command and replaces the complete
 // effective indexed Git configuration block supplied by env. Ordinary
 // instance variables that are absent from env remain available to the agent.
 // This must be called before Start() if the instance was created without a command.
-func (m *Manager) ConfigureWithEnvironment(command string, agentArgs []string, agentArgsPresent bool, env map[string]string, continueCommand string, continueArgs []string, continueArgsPresent bool) error {
-	return m.configure(command, agentArgs, agentArgsPresent, env, continueCommand, continueArgs, continueArgsPresent, true)
+func (m *Manager) ConfigureWithEnvironment(command string, agentArgs []string, agentArgsPresent bool, env map[string]string, continueCommand string, continueArgs []string, continueArgsPresent bool, wrapper ...launchwrapper.Spec) error {
+	return m.configure(command, agentArgs, agentArgsPresent, env, continueCommand, continueArgs, continueArgsPresent, true, wrapper...)
 }
 
-func (m *Manager) configure(command string, agentArgs []string, agentArgsPresent bool, env map[string]string, continueCommand string, continueArgs []string, continueArgsPresent, replaceEnv bool) error {
+func (m *Manager) configure(command string, agentArgs []string, agentArgsPresent bool, env map[string]string, continueCommand string, continueArgs []string, continueArgsPresent, replaceEnv bool, wrapper ...launchwrapper.Spec) error {
 	m.startMu.Lock()
 	defer m.startMu.Unlock()
 
@@ -2239,6 +2307,10 @@ func (m *Manager) configure(command string, agentArgs []string, agentArgsPresent
 		return fmt.Errorf("cannot configure while agent is running")
 	}
 
+	spec, err := configuredLaunchWrapper(wrapper, agentArgsPresent)
+	if err != nil {
+		return err
+	}
 	args := agentArgs
 	if !agentArgsPresent {
 		args = config.ParseCommand(command)
@@ -2266,6 +2338,8 @@ func (m *Manager) configure(command string, agentArgs []string, agentArgsPresent
 
 	m.cfg.AgentCommand = command
 	m.cfg.AgentArgs = args
+	m.cfg.LaunchWrapper = launchwrapper.Profile(spec.Argv)
+	m.cfg.LaunchWrapperRequired = !spec.IsZero()
 
 	// Store continue command for one-shot adapters
 	if continueArgsPresent {
@@ -2282,11 +2356,7 @@ func (m *Manager) configure(command string, agentArgs []string, agentArgsPresent
 	}
 	m.setTrackerGitEnvironment(m.cfg.AgentEnv)
 
-	m.logger.Info("agent configured",
-		zap.String("command", command),
-		zap.Strings("args", args),
-		zap.String("continue_command", continueCommand),
-		zap.Int("env_count", len(env)))
+	m.logger.Info("agent configured", zap.Int("env_count", len(env)), zap.Bool("wrapped", !spec.IsZero()))
 
 	return nil
 }
@@ -2314,7 +2384,7 @@ func composeConfiguredAgentEnvironmentWithManagedGitTools(current []string, over
 		base[githubauth.CredentialCLIShimDirEnv],
 		base[githubauth.CredentialCLIBashEnvEnv],
 	)
-	removeObsoleteManagedCredentialEnvironment(base)
+	githubauth.RemoveManagedCredentialEnvironment(base)
 	filtered, err := gitconfigenv.Filter(base, func(index int, entries []gitconfigenv.Entry) bool {
 		return !githubauth.IsHostGitHubCredentialHelperEntry(entries[index].Key, entries[index].Value) &&
 			!githubauth.IsManagedGitCredentialConfigEntry(index, entries, managed)
@@ -2372,27 +2442,6 @@ func activateManagedGitToolsForCurrentAuthorization(env map[string]string, tools
 	config.ActivateManagedGitTools(env, shimDir, bashEnv)
 }
 
-func removeObsoleteManagedCredentialEnvironment(env map[string]string) {
-	for _, key := range []string{
-		githubauth.CredentialBrokerURLEnv,
-		githubauth.CredentialHelperPathEnv,
-		githubauth.CredentialCLIShimDirEnv,
-		githubauth.CredentialCLIBashEnvEnv,
-		githubauth.CredentialParentBashEnv,
-		githubauth.CredentialLeaseEnv,
-		githubauth.CredentialReissueCapabilityEnv,
-		githubauth.CredentialTaskIDEnv,
-		githubauth.CredentialSessionIDEnv,
-		githubauth.CredentialRepositoryEnv,
-		githubauth.CredentialOwnerEnv,
-		githubauth.CredentialRepoEnv,
-		githubauth.CredentialHostEnv,
-		githubauth.CredentialScopesEnv,
-	} {
-		delete(env, key)
-	}
-}
-
 func environmentMapFromSlice(env []string) map[string]string {
 	result := make(map[string]string, len(env))
 	for _, entry := range env {
@@ -2444,40 +2493,106 @@ func (m *Manager) createAdapter() error {
 	return nil
 }
 
-// forwardUpdates forwards updates from the adapter to the manager's channel
+// forwardUpdates forwards updates from the adapter to the manager's channel.
 func (m *Manager) forwardUpdates(agentAdapter adapter.AgentAdapter, stopCh <-chan struct{}) {
 	defer m.wg.Done()
+	defer m.closeDeliveryEventWriter()
 
 	updatesCh := agentAdapter.Updates()
+	var suppressedSubmissionID string
+	suppressOrdinaryOutput := false
+	var pending *adapter.AgentEvent
 	for {
-		select {
-		case update, ok := <-updatesCh:
-			if !ok {
+		var update adapter.AgentEvent
+		var ok bool
+		if pending != nil {
+			update, ok = *pending, true
+			pending = nil
+		} else {
+			select {
+			case update, ok = <-updatesCh:
+			case <-stopCh:
+				m.drainDeliveryUpdates(updatesCh)
 				return
 			}
-			persisted, err := m.persistDeliveryEvent(update)
-			if err != nil {
-				m.logger.Error("failed to commit durable delivery event", zap.Error(err))
-				// A configured journal is the commit-before-publish boundary. Stop
-				// forwarding when it cannot commit so the backend never observes an
-				// event that cannot be replayed after a disconnect.
-				m.status.Store(StatusError)
-				return
-			}
-			update = persisted
-			m.recordTerminalOutcome(&update)
-			if update.DeliverySequence > 0 && m.deliveryJournalAvailable() {
-				m.signalDeliveryWakeup()
+		}
+		if !ok {
+			return
+		}
+		update.DeliverySubmissionID = m.deliverySubmissionIDForEvent(update)
+		if suppressOrdinaryOutput && !isTerminalDeliveryEvent(update) {
+			if update.DeliverySubmissionID == "" || update.DeliverySubmissionID == suppressedSubmissionID {
 				continue
 			}
-			select {
-			case m.updatesCh <- update:
-			case <-stopCh:
+		}
+		persisted, err := m.persistDeliveryEvent(update)
+		if err != nil {
+			m.logger.Error("failed to commit durable delivery event", zap.Error(err))
+			// Capture the failure before cancellation, then keep the sole
+			// adapter consumer alive through a bounded drain so an actual
+			// terminal can still settle the retained submission.
+			suppressedSubmissionID = update.DeliverySubmissionID
+			suppressOrdinaryOutput = true
+			m.cancelDeliveryAfterStorageFailure(update.DeliverySubmissionID)
+			cont, terminalCommitted, carried := m.drainAfterDeliveryFailure(updatesCh, stopCh, suppressedSubmissionID)
+			if !cont {
 				return
 			}
+			if terminalCommitted {
+				suppressedSubmissionID = ""
+				suppressOrdinaryOutput = false
+			}
+			pending = carried
+			continue
+		}
+		if suppressOrdinaryOutput && (isTerminalDeliveryEvent(persisted) ||
+			(persisted.DeliverySubmissionID != "" && persisted.DeliverySubmissionID != suppressedSubmissionID)) {
+			suppressedSubmissionID = ""
+			suppressOrdinaryOutput = false
+		}
+		update = persisted
+		if update.Type == "" {
+			continue
+		}
+		m.recordTerminalOutcome(&update)
+		if update.DeliverySequence > 0 && m.deliveryJournalAvailable() {
+			m.signalDeliveryWakeup()
+			continue
+		}
+		select {
+		case m.updatesCh <- update:
 		case <-stopCh:
 			return
 		}
+	}
+}
+
+func (m *Manager) drainDeliveryUpdates(updates <-chan adapter.AgentEvent) {
+	for {
+		select {
+		case update, ok := <-updates:
+			if !ok {
+				return
+			}
+			update.DeliverySubmissionID = m.deliverySubmissionIDForEvent(update)
+			persisted, err := m.persistDeliveryEvent(update)
+			if err != nil {
+				return
+			}
+			m.recordTerminalOutcome(&persisted)
+			m.signalDeliveryWakeup()
+		default:
+			return
+		}
+	}
+}
+
+func (m *Manager) closeDeliveryEventWriter() {
+	m.deliveryJournalMu.RLock()
+	writer := m.deliveryWriter
+	m.deliveryJournalMu.RUnlock()
+	if writer != nil {
+		writer.close()
 	}
 }
 
@@ -2485,33 +2600,65 @@ func (m *Manager) forwardUpdates(agentAdapter adapter.AgentAdapter, stopCh <-cha
 // The normalized event is kept as an opaque payload here; backend projection
 // remains the owner of canonical task messages and workflow effects.
 func (m *Manager) persistDeliveryEvent(update adapter.AgentEvent) (adapter.AgentEvent, error) {
+	m.deliveryJournalMu.RLock()
+	deliveryJournal := m.deliveryJournal
+	eventLimit := m.deliveryLimit
+	if eventLimit <= 0 && deliveryJournal != nil && m.deliveryJournalErr == nil {
+		eventLimit = deliveryJournal.MaxEventBytes()
+	}
+	m.deliveryJournalMu.RUnlock()
+	if eventLimit <= 0 {
+		eventLimit = deliverylimits.MaxEventBytes
+	}
+	limit := deliverylimits.DisplayBudgetFor(eventLimit)
+	update = streams.PrepareToolEventWithLimit(update, limit)
 	m.deliveryJournalMu.Lock()
 	configured := m.cfg != nil && m.cfg.DurableJournalPath != ""
-	deliveryJournal := m.deliveryJournal
-	if deliveryJournal != nil && m.deliveryWriter == nil {
+	if configured && deliveryJournal != nil && m.deliveryJournalErr == nil && (m.deliveryWriter == nil ||
+		(m.deliveryWriter.ctx.Err() != nil && (m.Status() == StatusRunning || m.Status() == StatusStarting))) {
 		m.deliveryWriter = newDeliveryEventWriter(m)
 	}
 	writer := m.deliveryWriter
 	m.deliveryJournalMu.Unlock()
-	if !configured || deliveryJournal == nil {
+	if !configured {
 		return update, nil
 	}
+	if deliveryJournal == nil {
+		_, err := m.DeliveryJournal()
+		if err != nil {
+			m.recordDeliveryWriteFailure(err, update, eventLimit)
+		}
+		return update, err
+	}
 	if writer != nil {
-		return writer.persist(context.Background(), update)
+		persisted, err := writer.persist(context.Background(), update)
+		if err != nil {
+			m.recordDeliveryWriteFailure(err, update, eventLimit)
+		}
+		return persisted, err
 	}
 	committed, err := m.persistDeliveryBatch(context.Background(), []adapter.AgentEvent{update})
 	if err != nil {
+		m.recordDeliveryWriteFailure(err, update, eventLimit)
 		return update, err
 	}
 	return committed[0], nil
 }
 
-func (m *Manager) persistDeliveryBatch(ctx context.Context, updates []adapter.AgentEvent) ([]adapter.AgentEvent, error) {
+func (m *Manager) persistDeliveryBatchRaw(ctx context.Context, updates []adapter.AgentEvent) ([]adapter.AgentEvent, error) {
 	m.deliveryJournalMu.RLock()
+	configured := m.cfg != nil && m.cfg.DurableJournalPath != ""
 	deliveryJournal := m.deliveryJournal
+	deliveryJournalErr := m.deliveryJournalErr
 	m.deliveryJournalMu.RUnlock()
-	if deliveryJournal == nil {
+	if !configured {
 		return updates, nil
+	}
+	if deliveryJournal == nil {
+		if deliveryJournalErr != nil {
+			return updates, deliveryJournalErr
+		}
+		return updates, journal.ErrJournalCorrupt
 	}
 	events := make([]journal.Event, len(updates))
 	for i, update := range updates {
@@ -2549,13 +2696,8 @@ func (m *Manager) persistDeliveryBatch(ctx context.Context, updates []adapter.Ag
 			Terminal:          update.Type == adapter.EventTypeComplete || update.Type == adapter.EventTypeError,
 		}
 	}
-	committed, err := deliveryJournal.AppendBatch(ctx, events)
+	committed, err := m.appendDeliveryWithRecovery(ctx, deliveryJournal, events)
 	if err != nil {
-		m.deliveryJournalMu.Lock()
-		if m.deliveryJournalErr == nil {
-			m.deliveryJournalErr = err
-		}
-		m.deliveryJournalMu.Unlock()
 		return updates, err
 	}
 	for i := range updates {
@@ -2591,12 +2733,16 @@ func (m *Manager) SendErrorEventWithProviderError(
 	errorMessage string,
 	promptGeneration uint64,
 	providerError *streams.ProviderError,
+	storage ...*streams.DeliveryStorageDiagnostic,
 ) {
 	event := adapter.AgentEvent{
 		Type:             adapter.EventTypeError,
 		Error:            errorMessage,
 		PromptGeneration: promptGeneration,
 		ProviderError:    providerError,
+	}
+	if len(storage) > 0 && storage[0] != nil {
+		event.Storage = storage[0]
 	}
 	if persisted, err := m.persistDeliveryEvent(event); err != nil {
 		m.logger.Error("failed to commit durable error event", zap.Error(err))
@@ -2616,7 +2762,7 @@ func (m *Manager) PublishMCPAttachment(evidence streams.MCPAttachmentEvidence) {
 		MCPAttachment: &evidence,
 	}
 	if persisted, err := m.persistDeliveryEvent(event); err != nil {
-		m.logger.Error("failed to commit durable MCP attachment event", zap.Error(err))
+		m.logMCPAttachmentCommitError("failed to commit durable MCP attachment event", err)
 		return
 	} else {
 		event = persisted
@@ -2639,7 +2785,7 @@ func (m *Manager) PublishMCPAttachmentAttempt(attempt streams.MCPAttachmentAttem
 		MCPAttachmentAttempt: &attempt,
 	}
 	if persisted, err := m.persistDeliveryEvent(event); err != nil {
-		m.logger.Error("failed to commit durable MCP attachment attempt", zap.Error(err))
+		m.logMCPAttachmentCommitError("failed to commit durable MCP attachment attempt", err)
 		return
 	} else {
 		event = persisted
@@ -2692,12 +2838,17 @@ func (m *Manager) Stop(ctx context.Context) error {
 // before stopping every process owned by the manager.
 func (m *Manager) StopForTeardown(ctx context.Context) error {
 	m.CloseAdmission()
+	passthroughErr := m.passthrough.StopAll(ctx)
+	passthroughErr = errors.Join(passthroughErr, m.cleanupPassthroughFiles(ctx))
 	previewErr := m.CloseWorkspacePreview(ctx)
 	if err := m.WaitForAdmission(ctx); err != nil {
-		return errors.Join(previewErr, fmt.Errorf("wait for process admission to drain: %w", err))
+		// Close durable storage even when an owner misses the drain deadline.
+		// Late readers then fail with a typed closed-journal error, and cannot
+		// mistake shutdown for an empty successful replay.
+		return errors.Join(previewErr, fmt.Errorf("wait for process admission to drain: %w", err), m.closeDeliveryJournal())
 	}
 	stopErr := m.stop(ctx)
-	return errors.Join(previewErr, stopErr, m.closeDeliveryJournal())
+	return errors.Join(passthroughErr, previewErr, stopErr, m.closeDeliveryJournal())
 }
 
 func (m *Manager) closeDeliveryJournal() error {
@@ -2705,8 +2856,12 @@ func (m *Manager) closeDeliveryJournal() error {
 		return nil
 	}
 	m.deliveryJournalClose.Do(func() {
-		if m.deliveryWriter != nil {
-			m.deliveryWriter.close()
+		m.deliveryJournalMu.Lock()
+		m.deliveryJournalErr = journal.ErrJournalClosed
+		writer := m.deliveryWriter
+		m.deliveryJournalMu.Unlock()
+		if writer != nil {
+			writer.close()
 		}
 		m.deliveryJournalMu.Lock()
 		defer m.deliveryJournalMu.Unlock()
@@ -2715,11 +2870,18 @@ func (m *Manager) closeDeliveryJournal() error {
 		}
 		m.deliveryJournalCloseErr = m.deliveryJournal.Close()
 		m.deliveryJournal = nil
+		m.deliveryJournalErr = journal.ErrJournalClosed
+		if m.deliveryJournalCloseErr != nil {
+			m.deliveryJournalErr = errors.Join(journal.ErrJournalClosed, m.deliveryJournalCloseErr)
+		}
 	})
 	return m.deliveryJournalCloseErr
 }
 
 func (m *Manager) stop(ctx context.Context) error {
+	if err := m.passthrough.StopAll(ctx); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -2772,6 +2934,9 @@ func (m *Manager) stop(ctx context.Context) error {
 		zap.Int("pid", m.agentPID()),
 		zap.String("protocol", m.agentProtocol()))
 	m.status.Store(StatusStopping)
+	if stopping := m.shutdownIntent.Load(); stopping != nil {
+		stopping.Store(true)
+	}
 
 	auxiliaryStopErr := errors.Join(comparisonStopErr, m.stopShellAndProcesses(ctx))
 	m.closeAdapterAndStdin()
@@ -2861,6 +3026,9 @@ func (m *Manager) stopShellAndProcesses(ctx context.Context) error {
 // It reports whether this call closed stopCh, i.e. whether goroutines were just
 // released and still need draining.
 func (m *Manager) closeAdapterAndStdin() bool {
+	if stopping := m.shutdownIntent.Load(); stopping != nil {
+		stopping.Store(true)
+	}
 	m.logger.Debug("closing adapter")
 	if m.adapter != nil {
 		if err := m.adapter.Close(); err != nil {
@@ -2869,7 +3037,6 @@ func (m *Manager) closeAdapterAndStdin() bool {
 	}
 	m.logger.Debug("adapter closed")
 
-	m.logger.Debug("closing stop channel")
 	closedStopCh := false
 	if m.stopCh != nil && m.stopChClosed.CompareAndSwap(false, true) {
 		close(m.stopCh)
@@ -3240,6 +3407,9 @@ func (m *Manager) readStderr(stderrDone chan<- stderrReadResult) {
 		}
 
 		line, keep := safeManagedNpmStderrLine(rawLine)
+		if !keep && m.cfg != nil && !m.cfg.LaunchWrapper.IsZero() {
+			continue
+		}
 		if !keep {
 			line, keep = rawLine, true
 			if m.stderrSanitizer != nil {

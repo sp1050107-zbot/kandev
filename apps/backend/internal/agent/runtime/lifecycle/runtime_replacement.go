@@ -133,7 +133,7 @@ func (m *Manager) runtimeLossState(execution *AgentExecution, runtimeEpoch uint6
 			return
 		}
 		state.promptGeneration = current.promptGeneration
-		state.submissionID = current.deliverySubmissionIDSnapshot()
+		state.submissionID = currentDeliverySubmissionID(current)
 		state.reconcile, state.uncertain = classifyRuntimeLossStatus(current.Status, state.submissionID)
 	}); err != nil {
 		return runtimeLossExecutionState{}
@@ -152,7 +152,9 @@ func classifyRuntimeLossStatus(status v1.AgentStatus, submissionID string) (bool
 		return true, submissionID != ""
 	case v1.AgentStatusRunning:
 		return true, true
-	case v1.AgentStatusReady:
+	case v1.AgentStatusReady, v1.AgentStatusFailed:
+		// Local cancellation can fail the execution before durable settlement.
+		// Runtime loss must still publish uncertainty for its pending submission.
 		return submissionID != "", submissionID != ""
 	default:
 		return false, false
@@ -166,7 +168,7 @@ func (m *Manager) isRetiredLocalExecution(execution *AgentExecution) bool {
 
 func (m *Manager) isIdleSettledRetiredLocalExecution(execution *AgentExecution) bool {
 	return m.isRetiredLocalExecution(execution) && execution.Status == v1.AgentStatusReady &&
-		execution.deliverySubmissionIDSnapshot() == ""
+		currentDeliverySubmissionID(execution) == ""
 }
 
 func (m *Manager) runtimeReplacementRecoveryError(execution *AgentExecution) error {

@@ -25,7 +25,7 @@ import (
 	taskservice "github.com/kandev/kandev/internal/task/service"
 	"github.com/kandev/kandev/internal/testutil"
 	workflowrepo "github.com/kandev/kandev/internal/workflow/repository"
-	"github.com/kandev/kandev/pkg/pluginsdk"
+	"github.com/kdlbs/kandev/pluginsdk"
 	"github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/require"
 )
@@ -284,6 +284,19 @@ func TestManagedDeletionHostReceipts(t *testing.T) {
 			spec := f.spec
 			spec.RequestID = "replacement-request"
 			spec.IdempotencyKey = "replacement"
+			blocked, _, err := f.manager.Ensure(ctx, spec)
+			require.NoError(t, err)
+			require.Equal(t, pluginsdk.CommandUnavailable, blocked.Status)
+			completed := false
+			for range 8 {
+				result, err := f.other.RunAgentDeliveryRetirementBatch(ctx, models.AgentDeliveryRetirementBatchOptions{})
+				require.NoError(t, err)
+				if result.Completed == 1 {
+					completed = true
+					break
+				}
+			}
+			require.True(t, completed, "delivery retirement must finish before deterministic replacement")
 			created, replacement, err := f.manager.Ensure(ctx, spec)
 			require.NoError(t, err)
 			require.Equal(t, pluginsdk.CommandApplied, created.Status)

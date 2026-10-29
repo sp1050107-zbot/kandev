@@ -1,5 +1,8 @@
 import type { FetchedSessionData } from "@/lib/ssr/session-page-state";
-import type { TaskSessionHydrationEpoch } from "@/lib/state/slices/session/types";
+import type {
+  ActiveTurnWindowObservation,
+  TaskSessionHydrationEpoch,
+} from "@/lib/state/slices/session/types";
 import type {
   TaskNavigationContext,
   TaskNavigationIdentity,
@@ -13,7 +16,14 @@ export type TaskDetailRouteState =
       data: FetchedSessionData;
       forceMergeSession: boolean;
       navigationContext?: TaskNavigationContext;
+      turnWindowObservationsAtRequestStart?: Readonly<Record<string, ActiveTurnWindowObservation>>;
       hydrationEpochsAtRequestStart?: Readonly<Record<string, TaskSessionHydrationEpoch>>;
       enrichmentIdentity?: TaskNavigationIdentity;
     }
-  | { routeKey: string; status: "error"; data: null };
+  | {
+      routeKey: string;
+      status: "error";
+      data: null;
+      temporary?: boolean;
+      sessionAdmission?: "unavailable" | "read_failed";
+    };

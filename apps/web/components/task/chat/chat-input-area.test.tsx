@@ -21,6 +21,9 @@ const mockState = {
   office: { tasks: { items: [] } },
 };
 
+vi.mock("@/components/task/chat/use-composer-prompt-suggestion", () => ({
+  useComposerPromptSuggestion: () => ({ promptSuggestion: null }),
+}));
 vi.mock("@/components/state-provider", () => ({
   useAppStore: (selector: (state: typeof mockState) => unknown) => selector(mockState),
   useAppStoreApi: () => ({ getState: () => mockState }),
@@ -204,6 +207,7 @@ function panelState(overrides = {}) {
 function composerPanelState(overrides = {}) {
   return {
     ...panelState(),
+    hasPendingClarification: true,
     session: { state: "WAITING_FOR_INPUT", pending_action: "clarification" },
     task: { id: "task-1", title: "Task" },
     taskDescription: "Task description",
@@ -297,6 +301,7 @@ describe("ChatInputArea proceed visibility", () => {
         handleCancelTurn={vi.fn().mockResolvedValue(undefined)}
         showRequestChangesTooltip={false}
         panelState={composerPanelState({
+          hasPendingClarification: false,
           session: { state: "WAITING_FOR_INPUT", pending_action: null },
         })}
         isSending={false}

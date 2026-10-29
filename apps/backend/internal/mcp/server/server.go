@@ -25,6 +25,7 @@ import (
 	"github.com/kandev/kandev/internal/mcp/toolschema"
 	"github.com/kandev/kandev/internal/mcp/tooltokens"
 	taskcontract "github.com/kandev/kandev/internal/task/contract"
+	"github.com/kandev/kandev/internal/task/models"
 	ws "github.com/kandev/kandev/pkg/websocket"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -627,7 +628,7 @@ func opaqueMCPConnectionID(connectionID string) string {
 func (s *Server) RegisterRoutes(router gin.IRouter) {
 	router.GET("/sse", gin.WrapH(s.sseServer.SSEHandler()))
 	router.POST("/message", gin.WrapH(s.sseServer.MessageHandler()))
-	router.Any("/mcp", gin.WrapH(s.httpServer))
+	router.Any("/mcp", gin.WrapH(s.streamableHTTPHandler()))
 
 	s.logger.Info("registered MCP routes", zap.String("sse", "/sse"), zap.String("http", "/mcp"))
 }
@@ -638,7 +639,7 @@ func (s *Server) RegisterRoutes(router gin.IRouter) {
 func (s *Server) RegisterBackendRoutes(router gin.IRouter) {
 	router.GET("/mcp/sse", gin.WrapH(s.sseServer.SSEHandler()))
 	router.POST("/mcp/message", gin.WrapH(s.sseServer.MessageHandler()))
-	router.Any("/mcp", gin.WrapH(s.httpServer))
+	router.Any("/mcp", gin.WrapH(s.streamableHTTPHandler()))
 
 	s.logger.Info("registered MCP backend routes",
 		zap.String("sse", "/mcp/sse"),
@@ -1202,6 +1203,7 @@ func (s *Server) profileToolGroups() []profileToolGroup {
 		{name: "task-transfer", enabled: func(ctx mcpprofile.Context) bool { return config(ctx) || external(ctx) || office(ctx) }, register: func(s *Server) { s.registerTaskTransferTool() }},
 		{name: "configuration-settings", enabled: func(ctx mcpprofile.Context) bool { return config(ctx) || external(ctx) }, register: func(s *Server) { s.registerConfigSettingsTools() }},
 		{name: "external-create-task", enabled: external, register: func(s *Server) { s.registerCreateTaskTool() }},
+		{name: "external-update-task", enabled: external, register: func(s *Server) { s.registerUpdateTaskTool() }},
 		{name: "external-questions", enabled: external, register: func(s *Server) { s.registerQuestionAnsweringTools() }},
 		{name: "external-agent-permissions", enabled: external, register: func(s *Server) { s.registerAgentPermissionTools() }},
 		// Dependency edges are manageable wherever a task can be created.
@@ -1390,32 +1392,23 @@ func (s *Server) registerKanbanTools() {
 		),
 		s.wrapHandler("list_agents_kandev", s.listAgentsHandler()),
 	)
+	s.registerListExecutorsTool()
 	s.mcpServer.AddTool(
 		mcp.NewTool("list_executor_profiles_kandev",
-			mcp.WithDescription("List all profiles for an executor. Use this to find available executor_profile_ids for create_task_kandev. Standard executor IDs: exec-local (standalone process), exec-worktree (git worktree), exec-local-docker (Docker container), exec-sprites (cloud)."),
-			mcp.WithString("executor_id", mcp.Required(), mcp.Description("The executor ID (e.g. exec-local, exec-worktree, exec-local-docker, exec-sprites)")),
+			mcp.WithDescription("List profiles for the specified executor. Call list_executors_kandev first to discover visible executors and their profiles, including custom executor IDs. A returned profile ID can be selected with executor_profile_id in create_task_kandev."),
+			mcp.WithString("executor_id", mcp.Required(), mcp.Description("The executor ID returned by list_executors_kandev")),
 		),
 		s.wrapHandler("list_executor_profiles_kandev", s.listExecutorProfilesHandler()),
 	)
-	s.mcpServer.AddTool(
-		mcp.NewTool("update_task_kandev",
-			mcp.WithDescription("Update an existing task."),
-			mcp.WithString("task_id", mcp.Required(), mcp.Description("The task ID")),
-			mcp.WithString("title", mcp.MaxLength(taskcontract.TaskTitleMaxLength), mcp.Description("New concise task title (maximum 60 characters)")),
-			mcp.WithString("description", mcp.Description("New description")),
-			mcp.WithString("state", mcp.Description("New state: not_started, in_progress, etc.")),
-			mcp.WithString("deferred_launch_prompt", mcp.Description("Replace the prompt a not-yet-started task will launch with. Only valid for a task created with blocked_by (+ start_agent), whose launch is still waiting on its dependencies — use it to refresh a brief that went stale while the chain ran. Rejected once the task has started; send new context with message_task_kandev instead. When this is rejected, no other field in the same call is applied.")),
-		),
-		s.wrapHandler("update_task_kandev", s.updateTaskHandler()),
-	)
+	s.registerUpdateTaskTool()
 	s.mcpServer.AddTool(
 		mcp.NewTool("move_task_kandev",
-			mcp.WithDescription(`Move a task to a different workflow step. A request naming the task's current workflow and step, without entry options, returns "applied" with the stored task because the destination already holds; no retry is needed. Only an actual step change is deferred to turn-end while the source session is RUNNING or STARTING. Idle-session and admin step changes apply immediately. Returns a move-result envelope: "disposition" is "applied" for a completed move or current-step no-op, or "deferred" when a step change was recorded for turn-end; "task" is the stored or moved task. An optioned step change also returns "move_id" and the accepted "entry_options" so you can correlate the one-shot override with the eventual entry.`),
+			mcp.WithDescription(`Move a task to a different workflow step. A request naming the task's current workflow and step, without entry options, returns "applied" with the stored task because the destination already holds; no retry is needed. Only an actual step change is deferred to turn-end while the source session is RUNNING or STARTING. Idle-session and admin step changes apply immediately. Returns a move-result envelope: "disposition" is "applied" for a completed move or current-step no-op, or "deferred" when a step change was recorded for turn-end; "task" is the stored or moved task. An optioned step change also returns "move_id" and the accepted "entry_options" so you can correlate the one-shot override with the eventual entry. Moving to a manual step that does not start an agent on entry (for example Waiting, Blocked, or Done) must not carry a prompt or entry_options; such a call is rejected with a validation error. Record the instruction in the task description or plan instead.`),
 			mcp.WithString("task_id", mcp.Required(), mcp.Description("The task ID")),
 			mcp.WithString("workflow_id", mcp.Required(), mcp.Description("Target workflow ID")),
 			mcp.WithString("workflow_step_id", mcp.Required(), mcp.Description("Target workflow step ID")),
 			mcp.WithNumber("position", mcp.Description("Requested position (0-based); the server determines arrival order, and a current-step request preserves the stored position.")),
-			mcp.WithString("prompt", mcp.Description("Optional hand-off message for the receiving agent at a new step. Only actual step changes are deferred during an active turn; non-empty prompts are invalid for a current-step request.")),
+			mcp.WithString("prompt", mcp.Description("Optional hand-off message for the receiving agent at a new step. Only actual step changes are deferred during an active turn; non-empty prompts are invalid for a current-step request. Omit it when the target step does not start an agent on entry.")),
 			moveTaskEntryOptionsToolOption(),
 		),
 		s.wrapHandler("move_task_kandev", s.moveTaskHandler()),
@@ -1428,6 +1421,9 @@ func (s *Server) registerKanbanTools() {
 			mcp.WithIdempotentHintAnnotation(false),
 			mcp.WithOpenWorldHintAnnotation(false),
 			mcp.WithString("task_id", mcp.Required(), mcp.Description("The task ID to delete")),
+			mcp.WithString("workspace_cleanup", mcp.Enum("delete", "retain"), mcp.Description("Use retain to delete the task while keeping workspace files, including when workspace inspection fails. Defaults to delete.")),
+			mcp.WithBoolean("discard_worktree_changes", mcp.Description("Allow removal of local workspace changes.")),
+			mcp.WithBoolean("allow_unverified_workspace_changes", mcp.Description("Acknowledge that workspace changes cannot be checked. Requires discard_worktree_changes=true and workspace_cleanup=delete. Task removal succeeds independently of pending physical cleanup.")),
 		),
 		s.wrapHandler("delete_task_kandev", s.deleteTaskHandler()),
 	)
@@ -1483,6 +1479,21 @@ func (s *Server) registerKanbanTools() {
 		s.wrapHandler("get_task_conversation_kandev", s.getTaskConversationHandler()),
 	)
 	s.registerListTaskSessionsTool()
+}
+
+func (s *Server) registerUpdateTaskTool() {
+	s.mcpServer.AddTool(
+		mcp.NewTool("update_task_kandev",
+			mcp.WithDescription("Update an existing task."),
+			mcp.WithString("task_id", mcp.Required(), mcp.Description("The task ID")),
+			mcp.WithString("title", mcp.MaxLength(taskcontract.TaskTitleMaxLength), mcp.Description("New concise task title (maximum 60 characters)")),
+			mcp.WithString("description", mcp.Description("New description")),
+			mcp.WithString("priority", mcp.Enum(models.TaskPriorityCritical, models.TaskPriorityHigh, models.TaskPriorityMedium, models.TaskPriorityLow), mcp.Description("New task priority")),
+			mcp.WithString("state", mcp.Description("New state: not_started, in_progress, etc.")),
+			mcp.WithString("deferred_launch_prompt", mcp.Description("Replace the prompt a not-yet-started task will launch with. Only valid for a task created with blocked_by (+ start_agent), whose launch is still waiting on its dependencies — use it to refresh a brief that went stale while the chain ran. Rejected once the task has started; send new context with message_task_kandev instead. When this is rejected, no other field in the same call is applied.")),
+		),
+		s.wrapHandler("update_task_kandev", s.updateTaskHandler()),
+	)
 }
 
 func (s *Server) registerPRAutomationTools() {
@@ -1613,6 +1624,7 @@ func (s *Server) registerCreateTaskTool() {
 			mcp.WithString("workspace_mode", mcp.Enum("inherit_parent", "new_workspace"), mcp.Description("Optional materialized-workspace mode. Omit for subtasks to inherit the parent's workspace/worktree. inherit_parent requires parent_id and reuses the parent's materialized workspace/worktree; new_workspace requests a separate workspace/worktree.")),
 			mcp.WithString("title", mcp.Required(), mcp.MaxLength(taskcontract.TaskTitleMaxLength), mcp.Description("A concise, few-word task title (maximum 60 characters).")),
 			mcp.WithString("prompt", mcp.Description("The initial prompt for the task agent. This is the ONLY context the agent receives when it starts — treat it as the agent's first user message. For auto-started subtasks, provide a specific and detailed prompt; omitting it starts the task agent without task-specific context.")),
+			mcp.WithString("priority", mcp.Enum(models.TaskPriorityCritical, models.TaskPriorityHigh, models.TaskPriorityMedium, models.TaskPriorityLow), mcp.DefaultString(models.TaskPriorityMedium), mcp.Description("Task priority. Defaults to medium when omitted.")),
 			mcp.WithBoolean("autopilot", mcp.Description("Start this task in autopilot mode. Default: false. The value is fixed at creation and is not inherited by subtasks. The agent does not ask the user directly; it asks its direct parent only for critical decisions.")),
 			mcp.WithString("agent_profile_id", mcp.Description(agentProfileDesc)),
 			mcp.WithString("executor_profile_id", mcp.Description("Executor profile ID to use (determines the runtime environment: local, worktree, docker, etc.). For subtasks, inherited from the parent session. For top-level tasks, ask the user which executor profile they want if not already known.")),
@@ -1962,7 +1974,8 @@ const askUserQuestionOutputSchema = `{
     "type": "object",
     "description": "Answer keyed by question id.",
     "properties": {
-      "selected_option": {"type": "string"},
+      "selected_option": {"type": "string", "description": "ID of the selected option."},
+      "selected_label": {"type": "string", "description": "Exact label of the selected option. Omitted when the ID cannot identify one offered option."},
       "custom_text": {"type": "string"},
       "answered": {"type": "boolean"},
       "rejected": {"type": "boolean"}
@@ -1974,18 +1987,18 @@ const askUserQuestionOutputSchema = `{
 func (s *Server) registerInteractionTools() {
 	s.mcpServer.AddTool(
 		mcp.NewTool("ask_user_question_kandev",
-			mcp.WithDescription(`Ask the user 1-4 related questions and wait for all answers. Each question requires a prompt and 2-6 concrete options with short labels and descriptions; use a stable id when response keys matter. Set allow_custom_text=false when the user must choose an offered option. Call only when required input cannot be inferred, and bundle related questions in one call. Returns answers keyed by question id; a rejected bundle includes rejected=true and may include reject_reason.`),
+			mcp.WithDescription(`Ask the user 1-4 related questions; wait for all answers. Each needs a prompt and 2-6 labeled, described options. Use a stable id when response keys matter. Set allow_custom_text=false to require an offered option. Ask only when input is needed. Keep context to 1-3 short sentences or brief bullets, about 100 words or fewer. Put full reports, logs, and repeated conversation outside this call, before it; keep questions and options self-contained. Returns answers by question ID with selected_option ID and selected_label for matches. Rejections include rejected=true and may include reject_reason.`),
 			mcp.WithDestructiveHintAnnotation(false),
 			mcp.WithRawOutputSchema(json.RawMessage(askUserQuestionOutputSchema)),
 			mcp.WithArray(questionsArg, mcp.Required(),
 				mcp.Description(`Array of 1-4 question objects. Each question must have a "prompt" (the question text) and an "options" array (2-6 entries with label + description). Optional fields: "id" (stable identifier in the response map; auto-generated if omitted), "title" (≤12 chars short label), "allow_custom_text" (boolean, defaults to true).`),
 				mcp.MinItems(1),
 				mcp.MaxItems(4),
-				mcp.Items(buildQuestionSchemaItem()),
+				mcp.Items(buildOperatorQuestionSchemaItem()),
 			),
-			mcp.WithString("context", mcp.Description("Optional single block of shared background information. Preserved verbatim; use context_paragraphs for multiple paragraphs.")),
+			mcp.WithString("context", mcp.Description("Optional single block of shared background. Aim for 1-3 short sentences or brief bullets (about 100 words or fewer). Put full reports, logs, and repeated conversation outside the tool call, before it. Preserved verbatim; use context_paragraphs for multiple paragraphs.")),
 			mcp.WithArray(contextParagraphsArg,
-				mcp.Description("Optional shared background as separate paragraphs. Preferred for multiline context; when non-empty, overrides context and is joined with blank lines."),
+				mcp.Description("Optional shared background split into paragraphs. Aim for 1-3 short sentences or brief bullets (about 100 words or fewer). Put full reports, logs, and repeated conversation outside the tool call, before it. Preferred for multiline context; when non-empty, overrides context and is joined with blank lines."),
 				mcp.Items(map[string]any{"type": "string"}),
 			),
 		),

@@ -361,6 +361,49 @@ func TestFeatureFlagDefaults_LowercasesShortName(t *testing.T) {
 	}
 }
 
+// TestShippedProfilesEnableBackgroundWork pins AC-AGENTS-BACKGROUND-WORK-001.5:
+// shipped profiles default shared background-work inspection to enabled, and an
+// explicit operator value still wins over the profile default.
+func TestShippedProfilesEnableBackgroundWork(t *testing.T) {
+	clearProfileSelectors(t)
+	clearProfilesYAMLVars(t)
+
+	for _, selector := range []struct {
+		name  string
+		env   string
+		value string
+	}{
+		{"prod", "", ""},
+		{"dev", "KANDEV_DEBUG_DEV_MODE", "true"},
+		{"e2e", "KANDEV_E2E_MOCK", "true"},
+	} {
+		t.Run(selector.name, func(t *testing.T) {
+			if selector.env != "" {
+				t.Setenv(selector.env, selector.value)
+			}
+			defaults, err := EnvironmentDefaults()
+			if err != nil {
+				t.Fatalf("EnvironmentDefaults: %v", err)
+			}
+			if got := defaults["KANDEV_FEATURES_AGENT_BACKGROUND_WORK"]; got != "true" {
+				t.Fatalf("KANDEV_FEATURES_AGENT_BACKGROUND_WORK = %q, want \"true\"", got)
+			}
+		})
+	}
+}
+
+// TestExplicitBackgroundWorkOffWinsOverProfileDefault pins that an operator's
+// explicit false is never overwritten by the profile default.
+func TestExplicitBackgroundWorkOffWinsOverProfileDefault(t *testing.T) {
+	t.Setenv("KANDEV_FEATURES_AGENT_BACKGROUND_WORK", "false")
+	if _, _, err := ApplyProfile(); err != nil {
+		t.Fatalf("ApplyProfile: %v", err)
+	}
+	if got := os.Getenv("KANDEV_FEATURES_AGENT_BACKGROUND_WORK"); got != "false" {
+		t.Fatalf("KANDEV_FEATURES_AGENT_BACKGROUND_WORK = %q, want explicit \"false\"", got)
+	}
+}
+
 func TestProfilesYAMLFeatureKeysUseRequiredPrefix(t *testing.T) {
 	file, err := parse(profilesYAML)
 	if err != nil {
@@ -478,6 +521,62 @@ func TestEnvironmentDefaults_CoordinatorPhase2PerProfile(t *testing.T) {
 			}
 			if got := defaults["KANDEV_FEATURES_COORDINATOR_PHASE2"]; got != tc.want {
 				t.Fatalf("KANDEV_FEATURES_COORDINATOR_PHASE2 = %q in %s, want %q", got, tc.name, tc.want)
+			}
+		})
+	}
+}
+
+func TestEnvironmentDefaults_CoordinatorPhase3PerProfile(t *testing.T) {
+	cases := []struct {
+		name     string
+		selector map[string]string
+		want     string
+	}{
+		{"prod", nil, "false"},
+		{"dev", map[string]string{"KANDEV_DEBUG_DEV_MODE": "true"}, "false"},
+		{"e2e", map[string]string{"KANDEV_E2E_MOCK": "true"}, "true"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearProfileSelectors(t)
+			clearProfilesYAMLVars(t)
+			for k, v := range tc.selector {
+				t.Setenv(k, v)
+			}
+			defaults, err := EnvironmentDefaults()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := defaults["KANDEV_FEATURES_COORDINATOR_PHASE3"]; got != tc.want {
+				t.Fatalf("KANDEV_FEATURES_COORDINATOR_PHASE3 = %q in %s, want %q", got, tc.name, tc.want)
+			}
+		})
+	}
+}
+
+func TestEnvironmentDefaults_CoordinatorPhase31PerProfile(t *testing.T) {
+	cases := []struct {
+		name     string
+		selector map[string]string
+		want     string
+	}{
+		{"prod", nil, "false"},
+		{"dev", map[string]string{"KANDEV_DEBUG_DEV_MODE": "true"}, "false"},
+		{"e2e", map[string]string{"KANDEV_E2E_MOCK": "true"}, "false"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearProfileSelectors(t)
+			clearProfilesYAMLVars(t)
+			for k, v := range tc.selector {
+				t.Setenv(k, v)
+			}
+			defaults, err := EnvironmentDefaults()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := defaults["KANDEV_FEATURES_COORDINATOR_PHASE31"]; got != tc.want {
+				t.Fatalf("KANDEV_FEATURES_COORDINATOR_PHASE31 = %q in %s, want %q", got, tc.name, tc.want)
 			}
 		})
 	}

@@ -145,6 +145,12 @@ func auditedStartupEnvironmentInventory() []auditedStartupEnvironment {
 		{envVar: "KANDEV_GITHUB_CREDENTIAL_BROKER_PUBLIC_BASE_URL", class: "catalog"},
 		{envVar: "KANDEV_TASK_PREPARATION_TIMEOUT", class: "catalog"},
 		{envVar: "KANDEV_TASK_STALL_DETECTION_THRESHOLD", class: "catalog"},
+		{envVar: "KANDEV_TASK_DELIVERY_RETENTION_PAYLOAD_GRACE", class: "catalog"},
+		{envVar: "KANDEV_TASK_DELIVERY_RETENTION_REPLAY_AGE", class: "catalog"},
+		{envVar: "KANDEV_TASK_DELIVERY_RETENTION_REPLAY_EVENTS", class: "catalog"},
+		{envVar: "KANDEV_TASK_DELIVERY_RETENTION_INTERVAL", class: "catalog"},
+		{envVar: "KANDEV_TASK_DELIVERY_RETENTION_BATCH_ROWS", class: "catalog"},
+		{envVar: "KANDEV_TASK_DELIVERY_RETENTION_BATCH_BYTES", class: "catalog"},
 		{envVar: "KANDEV_CREDENTIALS_FILE", class: "catalog"},
 		{envVar: "KANDEV_GH_MAX_CONCURRENT", class: "catalog"},
 		{envVar: "KANDEV_GIT_MAX_CONCURRENT", class: "catalog"},
@@ -338,6 +344,52 @@ func TestManagedAgentctlStartupConfigReflectsAgentSurvivalFlag(t *testing.T) {
 	cfg.Features.AgentSurvival = true
 	if got := cfg.ManagedAgentctlStartupConfig(); !got.AgentSurvivalEnabled {
 		t.Fatal("AgentSurvivalEnabled = false, want true when the runtime flag is on")
+	}
+}
+
+// TestManagedAgentctlStartupConfigReflectsAgentBackgroundWorkFlag pins that
+// the resolved child contract carries the effective
+// features.agentBackgroundWork value for this launch, so the adapter gate and
+// the backend read/action endpoints agree. An older backend omits the field,
+// which decodes as false and keeps provider-neutral behavior.
+func TestManagedAgentctlStartupConfigReflectsAgentBackgroundWorkFlag(t *testing.T) {
+	cfg := &Config{}
+	cfg.Agentctl.NotificationQueueCapacity = 4096
+	cfg.Agentctl.IdleReaperInterval = time.Minute
+
+	cfg.Features.AgentBackgroundWork = false
+	if got := cfg.ManagedAgentctlStartupConfig(); got.AgentBackgroundWorkEnabled {
+		t.Fatal("AgentBackgroundWorkEnabled = true, want false when the runtime flag is off")
+	}
+
+	cfg.Features.AgentBackgroundWork = true
+	if got := cfg.ManagedAgentctlStartupConfig(); !got.AgentBackgroundWorkEnabled {
+		t.Fatal("AgentBackgroundWorkEnabled = false, want true when the runtime flag is on")
+	}
+
+	encoded, err := EncodeAgentctlStartupConfig(cfg.ManagedAgentctlStartupConfig())
+	if err != nil {
+		t.Fatalf("EncodeAgentctlStartupConfig: %v", err)
+	}
+	decoded, err := DecodeAgentctlStartupConfig(encoded)
+	if err != nil {
+		t.Fatalf("DecodeAgentctlStartupConfig: %v", err)
+	}
+	if !decoded.AgentBackgroundWorkEnabled {
+		t.Fatal("AgentBackgroundWorkEnabled did not survive the child-process encoding round trip")
+	}
+}
+
+// TestAgentctlStartupConfigOmittedBackgroundWorkDecodesDisabled pins the
+// older-peers contract: a backend that never heard of this field leaves the
+// provider-neutral behavior in place.
+func TestAgentctlStartupConfigOmittedBackgroundWorkDecodesDisabled(t *testing.T) {
+	decoded, err := DecodeAgentctlStartupConfig(`{"configured":true,"idleTimeout":3600000000000,"idleReaperInterval":60000000000,"notificationQueueCapacity":4096}`)
+	if err != nil {
+		t.Fatalf("DecodeAgentctlStartupConfig: %v", err)
+	}
+	if decoded.AgentBackgroundWorkEnabled {
+		t.Fatal("AgentBackgroundWorkEnabled = true for a peer that omits it, want false")
 	}
 }
 

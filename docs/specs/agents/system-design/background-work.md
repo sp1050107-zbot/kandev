@@ -69,11 +69,18 @@ Capabilities distinguish observation and action:
   unknown row, never a command. Unknown action identifiers are rejected.
   Other jobs remain accessible in the shared list without pretending to be shells.
 
-Introduce `features.agentBackgroundWork` /
-`KANDEV_FEATURES_AGENT_BACKGROUND_WORK`, restart-required, default false in prod,
-dev, and e2e; targeted fixtures explicitly enable it. Wire config, the existing
-runtime flag registry, profiles, and frontend defaults through the current typed
-registry pattern. Do not copy an outdated config-switch pattern from a skill.
+The initial implementation introduced `features.agentBackgroundWork` /
+`KANDEV_FEATURES_AGENT_BACKGROUND_WORK` with all shipped defaults false.
+The [default-on promotion](../../../plans/opencode-background-continuity/task-07-default-on-rollout.md)
+changes prod, dev, and e2e defaults to true after its targeted checks pass.
+Retain the restart-required registry entry and backend/frontend gates as an
+operator off switch during rollout. Explicit environment and SQLite overrides
+retain their current precedence. Browser fallback defaults stay false until
+the backend supplies authoritative feature state.
+
+Use the existing typed registry and embedded-profile synchronization. A later
+flag retirement removes the gates and appends both identities to the retired
+registry. That retirement is outside the current package.
 `features.codexAppServer` still controls native Codex startup; both are needed
 for new native controls. The shared feature is independent of that gate for ACP.
 Do not change the Claude background prompt-handoff flag or its admission policy.
@@ -153,8 +160,32 @@ Represent this as terminal `ended` with `outcome_known=false` and render
 On backend start or transport loss, previously live inspection rows become
 unknown with controls disabled. Resume queries only the owning session's provider,
 reconciles stable bindings, and replaces capabilities for the new connection.
-Event-only providers remain unknown until fresh evidence. Browser disconnection
-alone does not imply provider disconnection. Session reset/deletion fences its
+Event-only providers remain unknown until fresh evidence.
+The end of the owning agent process is termination evidence for every
+non-terminal row of its session. Terminal session transitions, successful idle
+suspension, completed teardown, and startup reconciliation attempt settlement
+only when the runtime liveness probe confirms no live process. A live process or
+failed probe leaves work open; terminal session state and stop acknowledgement
+alone are not process-termination evidence. Successful stop evidence is bound to
+the exact execution in the durable runtime record; a delayed predecessor
+completion cannot settle work owned by a retained successor. Generic recovery
+cleanup may preserve a remote process even when it returns success, so it uses
+the same liveness and retained-owner guards as startup. These paths never launch
+an agent. Settlement holds the existing session lifecycle fence shared by launch
+and resume through the database commit. Teardown callbacks wait for that fence;
+state-change hooks that may already hold it attempt settlement without waiting.
+An execution identity change during the process probe invalidates the observation.
+
+Workload and run settlement commits in one database transaction, with PostgreSQL
+session-scoped transaction advisory locking shared by run observations. Only
+committed workload observations are returned for publication. Startup discovery
+also includes open runs under terminal parents, so older partial settlements
+remain repairable. Delayed non-terminal observations cannot reopen terminal
+parents or runs, including runs first observed after their parent ended. Late
+terminal provider observations may still supply the actual outcome and exit code.
+A provider that never reports completion, such as Claude's detached shells today,
+therefore cannot leave rows running past verified process termination. Browser
+disconnection alone does not imply provider disconnection. Session reset/deletion fences its
 incarnation before clearing client state; late events cannot recreate it.
 
 Persist row updates before emitting `task_session.background_work.updated` through
@@ -207,6 +238,47 @@ existing request/thread/turn correlation and session authorization; expose only
 references to that existing flow, never a second answer mechanism.
 
 ## Content and accounting
+
+For AC-AGENTS-BACKGROUND-WORK-004.5, the existing browser store appends
+`WorkloadOutputChunk.chunk` to the retained string and keeps its last 200 * 1024
+JavaScript UTF-16 code units. On each append it copies `chunk.offset` into
+`output_offset`; it does not derive a retained-window start from that value.
+The backend merge uses Go string byte lengths and its offset is not a JavaScript
+index. Do not subtract transport offsets from string lengths.
+
+The session runtime store owns a client-only sidecar per retained session and
+workload: its run identity, an output-generation token, and the number of JS
+code units evicted since that generation began. A store-local scalar allocates
+fresh generation tokens, including after removal and re-addition; no token or
+sidecar is a public DTO, wire field, or persisted schema. Each view separately
+owns its clear anchor `(session, work, run, generation, end)`. Clear captures
+`end = evicted + output.length`; render slices at
+`clamp(end - evicted, 0, output.length)` while the anchor identity and generation
+match. A missing or mismatched anchor displays the current retained output.
+Repeated Clear replaces the anchor. No cleared history is retained.
+
+On a real append, add `max(0, oldOutput.length + chunk.length - cap)` to the
+sidecar's evicted count in the same store update as the existing output slice.
+An accepted list snapshot with identical resulting output and run, or an accepted
+lifecycle update omitting output, preserves the generation and count; a rejected
+update changes neither. If an accepted independent snapshot or update actually
+replaces output with a different string, create a fresh generation with eviction
+count zero. The old view anchor no longer applies, so that replacement is shown
+as the current retained output; no content-overlap inference attempts to identify
+post-clear text. A changed run also starts a fresh generation. Selecting another
+session or workload cannot reuse an anchor. Removing a workload from a list,
+clearing background work, or purging its session removes its sidecar; re-addition
+gets a fresh generation. A view's Clear does not mutate shared output or another
+view's anchor. This specifies the current accepted store transitions, not stale
+snapshot ordering or a new reconciliation contract.
+
+The count and token are bounded scalar metadata per retained workload, with no
+historical string copy. Keep the existing cap, truncation indication, transport,
+and persisted history. Search filters the post-clear view and auto-scroll uses
+that view. The store subscription, anchor, and visible-output selection belong
+in `hooks/domains/session/use-cleared-background-output.ts`; the detail component
+uses that hook. The current phone chip drawer renders raw output without a clear
+control; this fix does not add one or change its composition.
 
 Add normalized workload-output observations for command output where the adapter
 can prove ownership and delivery. Source identity includes work, run, stream, and
@@ -383,4 +455,12 @@ package requires its own exact-head results.
 
 ## Implementation package
 
-[Plan and work orders](../../../plans/agent-background-work/plan.md).
+OpenCode continuous background delivery extends this shared contract through
+[its provider design](background-work-opencode.md) and
+[implementation package](../../../plans/opencode-background-continuity/plan.md).
+It reuses this viewer and preserves the existing admission boundary. OpenCode
+2.2.0 alone does not prove post-prompt completion delivery.
+
+[Plan and work orders](../../../plans/agent-background-work/plan.md). The
+[clear-window repair](../../../plans/background-work-clear-window/plan.md)
+owns the focused correction to local clear.

@@ -7,6 +7,10 @@ import type { ApiClient } from "../../helpers/api-client";
 import { SessionPage } from "../../pages/session-page";
 import type { FileTreePage } from "../../pages/file-tree-page";
 import { GitHelper, makeGitEnv, createStandardProfile } from "../../helpers/git-helper";
+import { watchWs } from "../../helpers/causal-waits";
+import { waitForSessionDone, waitForSessionGitHydration } from "../../helpers/session";
+
+test.use({ trace: "retain-on-failure" });
 
 // DnD in file-browser.tsx uses native HTML5 drag events (dragstart, dragover,
 // drop) keyed off React's onDragStart/Over/Drop. Playwright's locator.dragTo()
@@ -97,11 +101,19 @@ async function setupTask({
     )
     .toBe(true);
 
+  if (!task.session_id) throw new Error("Expected a session for the file tree task");
+  await waitForSessionDone(
+    apiClient,
+    task.id,
+    task.session_id,
+    `${taskTitle} initial turn finished`,
+  );
   await testPage.goto(`/t/${task.id}`);
   const session = new SessionPage(testPage);
   await session.waitForLoad();
+  await waitForSessionGitHydration(testPage, task.session_id);
   await session.clickTab("Files");
-  return session;
+  return { session, workspacePath, sessionId: task.session_id };
 }
 
 async function dispatchHtmlDnd(fileTree: FileTreePage, sourcePath: string, targetPath: string) {
@@ -176,7 +188,8 @@ test.describe("File tree drag and drop", () => {
     git.stageAll();
     git.commit("seed dnd");
 
-    const session = await setupTask({
+    const ws = watchWs(testPage);
+    const { session, workspacePath } = await setupTask({
       testPage,
       apiClient,
       seedData,
@@ -184,10 +197,19 @@ test.describe("File tree drag and drop", () => {
       taskTitle: "FT DnD Move",
       requiredPath: "movable.ts",
     });
-
+    const renameResponse = ws.waitForResponse("workspace.file.rename");
     await dispatchHtmlDnd(session.fileTree, "movable.ts", "target-dir");
+    await renameResponse;
+    // Initial Git loading can preserve Files, so select Changes explicitly.
+    await session.clickTab("Changes");
+    await expect(session.changes).toBeVisible();
+    await expect(session.changesFileRow("movable.ts")).toBeVisible({ timeout: 15_000 });
+    await expect(session.changesFileRow("target-dir/movable.ts")).toBeVisible({
+      timeout: 15_000,
+    });
+    await session.clickTab("Files");
 
-    // The file is removed from the root immediately (optimistic update).
+    // The completed move removes the source from the active Files tree.
     await expect(session.fileTreeNode("movable.ts")).toHaveCount(0, { timeout: 10_000 });
     // Expand the target folder to verify the moved child landed inside.
     // moveNodesInTree does not auto-expand the drop target.
@@ -195,11 +217,132 @@ test.describe("File tree drag and drop", () => {
     await expect(session.fileTreeNode("target-dir/movable.ts")).toBeVisible({ timeout: 10_000 });
 
     await expect
-      .poll(() => fs.existsSync(path.join(repoDir, "target-dir", "movable.ts")), {
+      .poll(() => fs.existsSync(path.join(workspacePath, "target-dir", "movable.ts")), {
         timeout: 10_000,
       })
       .toBe(true);
-    expect(fs.existsSync(path.join(repoDir, "movable.ts"))).toBe(false);
+    expect(fs.existsSync(path.join(workspacePath, "movable.ts"))).toBe(false);
+  });
+
+  test("selected directory carries selected and unselected descendants", async ({
+    testPage,
+    apiClient,
+    seedData,
+    backend,
+  }, testInfo) => {
+    // @covers AC-UI-FILE-MOVE-SELECTION-001.1 AC-UI-FILE-MOVE-SELECTION-001.2
+    const git = new GitHelper(seedData.repositoryPath, makeGitEnv(backend.tmpDir));
+    git.exec(`git checkout -b directory-selection-${Date.now()}`);
+    git.createFile("src/a.txt", "selected child sentinel");
+    git.createFile("src/sub/keep.txt", "unselected nested sentinel");
+    git.createFile("dest/keep.txt", "destination sentinel");
+    git.stageAll();
+    git.commit("seed directory selection");
+
+    type Frame = {
+      id: string;
+      type: string;
+      action: string;
+      payload: { session_id?: string; old_path?: string; new_path?: string; success?: boolean };
+    };
+    const requests: Frame[] = [];
+    const replies = new Map<string, Frame>();
+    const moveScope = { sessionId: "" };
+    testPage.on("websocket", (socket) => {
+      if (!socket.url().endsWith("/ws")) return;
+      socket.on("framesent", ({ payload }) => {
+        const frame = JSON.parse(String(payload)) as Frame;
+        if (
+          frame.action === "workspace.file.rename" &&
+          frame.payload.session_id === moveScope.sessionId
+        )
+          requests.push(frame);
+      });
+      socket.on("framereceived", ({ payload }) => {
+        const frame = JSON.parse(String(payload)) as Frame;
+        if (requests.some((request) => request.id === frame.id)) replies.set(frame.id, frame);
+      });
+    });
+    const { session, workspacePath, sessionId } = await setupTask({
+      testPage,
+      apiClient,
+      seedData,
+      profileName: "ft-directory-selection",
+      taskTitle: "FT Directory Selection",
+      requiredPath: "src/sub/keep.txt",
+    });
+    expect(sessionId).toBeTruthy();
+    moveScope.sessionId = sessionId!;
+    expect(fs.readFileSync(path.join(workspacePath, "src/a.txt"), "utf8")).toBe(
+      "selected child sentinel",
+    );
+    await session.fileTree.waitForFileTreeNode("src");
+    await session.fileTreeNode("src").click();
+    await session.fileTree.waitForFileTreeNode("src/a.txt");
+    await session.fileTreeNode("src/a.txt").click({ modifiers: ["Control"] });
+    await session.fileTreeNode("src").click({ modifiers: ["Control"] });
+    await expect(session.fileTreeNode("src/a.txt")).toHaveAttribute("data-selected", "true");
+    await expect(session.fileTreeNode("src")).toHaveAttribute("data-selected", "true");
+    await dispatchHtmlDnd(session.fileTree, "src/a.txt", "dest");
+    await expect
+      .poll(() => requests.length > 0 && requests.every(({ id }) => replies.has(id)), {
+        message: "Waiting for actual directory-selection rename replies",
+      })
+      .toBe(true);
+    const commandEvidence = testInfo.outputPath("directory-selection-commands.json");
+    fs.writeFileSync(
+      commandEvidence,
+      JSON.stringify({ workspacePath, requests, replies: [...replies.values()] }, null, 2),
+    );
+    await testInfo.attach("directory-selection-commands", {
+      path: commandEvidence,
+      contentType: "application/json",
+    });
+
+    expect(fs.existsSync(path.join(workspacePath, "src"))).toBe(false);
+    expect(fs.readFileSync(path.join(workspacePath, "dest/src/a.txt"), "utf8")).toBe(
+      "selected child sentinel",
+    );
+    expect(fs.readFileSync(path.join(workspacePath, "dest/src/sub/keep.txt"), "utf8")).toBe(
+      "unselected nested sentinel",
+    );
+    expect(fs.existsSync(path.join(workspacePath, "dest/a.txt"))).toBe(false);
+    expect(fs.readFileSync(path.join(workspacePath, "dest/keep.txt"), "utf8")).toBe(
+      "destination sentinel",
+    );
+    expect(requests.map(({ payload }) => payload)).toEqual([
+      { session_id: sessionId, old_path: "src", new_path: "dest/src" },
+    ]);
+    expect(replies.get(requests[0].id)?.payload.success).toBe(true);
+    // Wait for Git to report the complete move before returning to Files.
+    // Partial status updates can activate Changes again while the move settles.
+    await expect
+      .poll(() =>
+        testPage.evaluate((sid) => {
+          const state = Reflect.get(window, "__KANDEV_E2E_STORE__").getState();
+          const env = state.environmentIdBySessionId[sid] ?? sid;
+          const statuses = Object.values(state.gitStatus.byEnvironmentRepo[env] ?? {}) as Array<{
+            files?: Record<string, unknown>;
+          }>;
+          const paths = statuses.flatMap((status) => Object.keys(status.files ?? {}));
+          return ["src/a.txt", "src/sub/keep.txt", "dest/src/a.txt", "dest/src/sub/keep.txt"].every(
+            (path) => paths.includes(path),
+          );
+        }, sessionId!),
+      )
+      .toBe(true);
+    await session.clickTab("Changes");
+    await expect(session.changes).toBeVisible();
+    await expect(session.changesFileRow("dest/src/a.txt")).toBeVisible();
+    await expect(session.changesFileRow("dest/src/sub/keep.txt")).toBeVisible();
+    await session.clickTab("Files");
+    await session.fileTreeNode("dest").click();
+    await session.fileTree.waitForFileTreeNode("dest/src");
+    await session.fileTreeNode("dest/src").click();
+    await expect(session.fileTreeNode("dest/src/a.txt")).toBeVisible();
+    await session.fileTreeNode("dest/src/sub").click();
+    await session.fileTree.waitForFileTreeNode("dest/src/sub/keep.txt");
+    await expect(session.fileTreeNode("dest/a.txt")).toHaveCount(0);
   });
 
   test("drop is rejected when dragging a folder onto itself", async ({
@@ -214,7 +357,7 @@ test.describe("File tree drag and drop", () => {
     git.stageAll();
     git.commit("seed selfdir");
 
-    const session = await setupTask({
+    const { session } = await setupTask({
       testPage,
       apiClient,
       seedData,

@@ -62,9 +62,11 @@ function initialMockState(activeId: string | null = "ws-A"): MockState {
 }
 let mockState = initialMockState(null);
 
+const mockStore = { getState: () => mockState };
+
 vi.mock("@/components/state-provider", () => ({
   useAppStore: (selector: (s: MockState) => unknown) => selector(mockState),
-  useAppStoreApi: () => ({ getState: () => mockState }),
+  useAppStoreApi: () => mockStore,
 }));
 
 vi.mock("@/lib/api", () => ({
@@ -90,6 +92,24 @@ function makeWorkflow(id: string, workspaceId: string) {
 function setVisibility(value: DocumentVisibilityState) {
   Object.defineProperty(document, "visibilityState", { configurable: true, value });
 }
+
+describe("workflow collection refresh", () => {
+  it("retains provenance and normalizes an omitted prompt", async () => {
+    vi.clearAllMocks();
+    mockState = initialMockState();
+    const synced = { source: "github", source_path: ".kandev/workflows/review.yaml" };
+    mockListWorkflows.mockResolvedValueOnce({
+      workflows: [{ ...makeWorkflow("wf-A", "ws-A"), ...synced }],
+    });
+    renderHook(() => useWorkflows("ws-A", true));
+    await waitFor(() =>
+      expect(mockSetWorkflows).toHaveBeenCalledWith(
+        [expect.objectContaining({ ...synced, prompt: "" })],
+        undefined,
+      ),
+    );
+  });
+});
 
 describe("useWorkflows — stale response guard", () => {
   beforeEach(() => {

@@ -22,7 +22,7 @@ import (
 	"github.com/kandev/kandev/internal/common/logger"
 	"github.com/kandev/kandev/internal/task/models"
 	"github.com/kandev/kandev/internal/task/recoveryclaim"
-	"github.com/kandev/kandev/pkg/pluginsdk"
+	"github.com/kdlbs/kandev/pluginsdk"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 )
@@ -78,17 +78,19 @@ type PluginExecutorInventoryStore interface {
 }
 
 type pluginControlClientFactory func(context.Context, agentctl.ConnectionLeaseResolver, *logger.Logger, string) (*agentctl.ControlClient, string, error)
-type pluginRecoveredAgentctlClientFactory func(context.Context, agentctl.ConnectionLeaseResolver, *logger.Logger, string, string) (*agentctl.Client, error)
+type pluginAgentctlClientFactory func(context.Context, agentctl.ConnectionLeaseResolver, *logger.Logger, string, string) (*agentctl.Client, error)
+type pluginRecoveredAgentctlInstanceReader func(context.Context, agentctl.ConnectionLeaseResolver, *logger.Logger, string, string) (*agentctl.InstanceInfo, error)
 type pluginAgentctlReadinessCheck func(context.Context, *agentctl.Client) error
 
 type PluginRemoteExecutor struct {
-	operations                 PluginExecutorProviderOperations
-	logger                     *logger.Logger
-	profileLoader              PluginExecutorProfileLoader
-	inventoryStore             PluginExecutorInventoryStore
-	newAgentctlControlClient   pluginControlClientFactory
-	newRecoveredAgentctlClient pluginRecoveredAgentctlClientFactory
-	ready                      pluginAgentctlReadinessCheck
+	operations                  PluginExecutorProviderOperations
+	logger                      *logger.Logger
+	profileLoader               PluginExecutorProfileLoader
+	inventoryStore              PluginExecutorInventoryStore
+	newAgentctlControlClient    pluginControlClientFactory
+	newAgentctlClient           pluginAgentctlClientFactory
+	recoveredAgentctlInfoReader pluginRecoveredAgentctlInstanceReader
+	ready                       pluginAgentctlReadinessCheck
 }
 
 func (r *PluginRemoteExecutor) SetRecoveryDependencies(loader PluginExecutorProfileLoader, inventory PluginExecutorInventoryStore) {
@@ -130,9 +132,23 @@ func NewPluginRemoteExecutor(operations PluginExecutorProviderOperations, log *l
 	}
 	runtime := &PluginRemoteExecutor{operations: operations, logger: log.WithFields(zap.String("runtime", string(executor.NamePluginRemote)))}
 	runtime.newAgentctlControlClient = createPluginEndpointControlClient
-	runtime.newRecoveredAgentctlClient = func(ctx context.Context, resolver agentctl.ConnectionLeaseResolver, log *logger.Logger, executionID, token string) (*agentctl.Client, error) {
+	runtime.newAgentctlClient = func(ctx context.Context, resolver agentctl.ConnectionLeaseResolver, log *logger.Logger, executionID, token string) (*agentctl.Client, error) {
 		return agentctl.NewEndpointClient(ctx, resolver, log,
 			agentctl.WithExecutionID(executionID), agentctl.WithAuthToken(token))
+	}
+	runtime.recoveredAgentctlInfoReader = func(
+		ctx context.Context,
+		resolver agentctl.ConnectionLeaseResolver,
+		log *logger.Logger,
+		executionID string,
+		token string,
+	) (*agentctl.InstanceInfo, error) {
+		control, err := agentctl.NewEndpointControlClient(ctx, resolver, log, agentctl.WithControlAuthToken(token))
+		if err != nil {
+			return nil, err
+		}
+		defer control.Close()
+		return control.GetInstance(ctx, executionID)
 	}
 	runtime.ready = func(ctx context.Context, client *agentctl.Client) error { return client.Health(ctx) }
 	return runtime
@@ -179,6 +195,7 @@ func (r *PluginRemoteExecutor) CreateInstance(ctx context.Context, req *Executor
 		return nil, err
 	}
 	r.uploadPluginExecutorAgentCredentials(ctx, client, launch.request)
+	r.applyPluginExecutorGitIdentity(ctx, client, launch.request)
 	return r.finishPluginExecutorLaunch(ctx, launch, resource, client, token)
 }
 
@@ -291,8 +308,8 @@ func (r *PluginRemoteExecutor) startPluginExecutorAgentctl(ctx context.Context, 
 		return fail("instance_create", err)
 	}
 	launch.inventory.InstancePort = instancePort
-	client, err := agentctl.NewEndpointClient(ctx, r.connectionResolver(launch.operationContext, resource, instancePort), r.logger,
-		agentctl.WithExecutionID(launch.request.InstanceID), agentctl.WithAuthToken(token))
+	client, err := r.newAgentctlClient(ctx, r.connectionResolver(launch.operationContext, resource, instancePort), r.logger,
+		launch.request.InstanceID, token)
 	if err != nil {
 		return fail("instance_connect", err)
 	}

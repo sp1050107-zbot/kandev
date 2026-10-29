@@ -32,6 +32,27 @@ Kandev keeps growing external integrations and surface-specific behavior directl
 - **AC-PLUGINS-PLUGINS-001.11:** A plugin shall access Kandev domain data and commands only through documented capability-gated Host contracts. Global MCP, private REST, direct database access, shell access, and prompt or comment text shall not confer plugin authority.
 - **AC-PLUGINS-PLUGINS-001.12:** When a required Host capability or result state is unknown or unsupported, the plugin shall receive a typed unsupported result and shall not fall back to a broader integration path.
 - **AC-PLUGINS-PLUGINS-001.13:** Kandev shall provide a connection-bound way for a plugin to discover supported capability families and approved workspace scope. The context shall describe authority but shall not grant authority. A missing, stale, or revoked context shall not grant authority. The Host shall enforce current approval on every request.
+- **AC-PLUGINS-PLUGINS-001.14:** When a package declares a stable
+  `min_kandev_version`, installation on a stamped Stable or published npm Nightly
+  host shall reject a minimum above the host's version without leaving an
+  installed package version, persisted installation record, registry entry, or
+  activated plugin. A Nightly is a prerelease below the Stable release with the
+  same numeric core; it shall satisfy earlier Stable minimums. Manifest minimums
+  shall retain their existing stable numeric grammar. Empty, development,
+  git-describe, and unknown or malformed development host versions shall retain
+  their compatibility-comparison exemption; independent manifest validation
+  shall still apply.
+- **AC-PLUGINS-PLUGINS-001.15:** When a plugin creates a task with launch
+  profiles (`launch.agent_profile_id`, `launch.executor_profile_id`), Kandev
+  shall reject a profile that does not exist with `InvalidArgument` before it
+  creates a new task, whether or not the plugin asks to start an agent. An exact
+  create retry shall resolve an existing task by external ID before it checks
+  profile availability, so removal of a profile after task creation does not
+  prevent recovery of the committed task. A task created without starting an
+  agent shall keep those profiles for a later start. On a workflow start, a
+  matching task-specific fixed-step profile, step profile, or workflow default
+  takes precedence over the saved agent profile. Kandev shall use the saved
+  agent profile when workflow policy selects no profile.
 
 ## System design
 

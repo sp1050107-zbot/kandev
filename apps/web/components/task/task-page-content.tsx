@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { IconAlertTriangle } from "@tabler/icons-react";
 import { Button } from "@kandev/ui/button";
 import Link from "@/components/routing/app-link";
@@ -22,17 +22,18 @@ import {
   readTaskNavigationIdentity,
   useTaskNavigationReadState,
 } from "@/lib/state/task-navigation-reads";
-import { useWorkflowSnapshotById } from "@/hooks/domains/kanban/use-all-workflow-snapshots";
 import { useWorkflowStepsById } from "@/hooks/domains/kanban/use-workflow-steps-by-id";
 import { useResponsiveBreakpoint } from "@/hooks/use-responsive-breakpoint";
 import { useFeature } from "@/hooks/domains/features/use-feature";
 import { useTaskCanvasesStateForTask } from "@/hooks/domains/task/use-task-canvases";
+import { useSearchParams } from "@/lib/routing/client-router";
 import { FOREGROUND_EVENT_COALESCE_MS, useForegroundRefresh } from "@/hooks/use-foreground-refresh";
 import type { Layout } from "react-resizable-panels";
 import {
   deriveIsAgentWorking,
   buildArchivedValue,
   hasResolvedTaskDetails,
+  isCreationPendingSearch,
   resolveEffectiveTask,
   resolveLatestTaskProjection,
   resolveTaskContentState,
@@ -56,10 +57,6 @@ type TaskPageContentProps = {
 
 export function useWorkflowStepsMapped(workflowId: string | null | undefined) {
   return useWorkflowStepsById(workflowId);
-}
-
-function useTaskWorkflowSnapshot(task: Task | null) {
-  useWorkflowSnapshotById(task?.workspace_id ?? null, task?.workflow_id ?? null);
 }
 
 function getTaskArchivedState(task: Task | null): boolean | null {
@@ -279,8 +276,10 @@ export function useTaskDetails(activeTaskId: string | null, initialTask: Task | 
   effectiveTaskIdRef.current = effectiveTaskId;
   const isCurrentTaskDetailsRequest = (requestId: number, taskId: string) =>
     requestId === taskDetailsRequestIdRef.current && effectiveTaskIdRef.current === taskId;
-  const kanbanTask = useAppStore((state) =>
-    resolveLatestTaskProjection(effectiveTaskId, state.kanban.tasks, state.kanbanMulti.snapshots),
+  const kanbanTask = useAppStore(
+    (state) =>
+      (effectiveTaskId ? state.taskOverview.byId[effectiveTaskId] : null) ??
+      resolveLatestTaskProjection(effectiveTaskId, state.kanban.tasks, state.kanbanMulti.snapshots),
   );
   const task = useMemo(
     () => resolveEffectiveTask(taskDetails, initialTask, kanbanTask, effectiveTaskId),
@@ -351,6 +350,9 @@ export function useTaskDetails(activeTaskId: string | null, initialTask: Task | 
     },
     [effectiveTaskId, loadTaskDetails],
   );
+  const isTemporaryTaskReadError =
+    isTemporaryTaskNavigationError(taskLoadError) ||
+    isTemporaryTaskNavigationReadPending(navigationReadState);
 
   return {
     task,
@@ -361,10 +363,17 @@ export function useTaskDetails(activeTaskId: string | null, initialTask: Task | 
     onTaskUnarchived,
     refreshTask: loadTaskDetails,
     retryTaskRead: () => loadTaskDetails(true, effectiveTaskId, true),
-    isTemporaryTaskReadError:
-      isTemporaryTaskNavigationError(taskLoadError) ||
-      (navigationReadState.phase === "failed" && navigationReadState.temporary),
+    isTemporaryTaskReadError,
   };
+}
+
+function isTemporaryTaskNavigationReadPending(
+  readState: ReturnType<typeof useTaskNavigationReadState>,
+): boolean {
+  if (!readState.temporary) return false;
+  return (
+    readState.phase === "loading" || readState.phase === "retrying" || readState.phase === "failed"
+  );
 }
 
 function useTaskPageData(
@@ -404,13 +413,18 @@ function useTaskPageData(
   } = useTaskDetails(fallbackTaskId ?? activeTaskId, initialTask);
 
   const agent = useSessionAgent(task);
-  const ensureSession = useEnsureTaskSession({
-    id: task?.id,
-    isArchived: task?.archived_at != null,
-    archiveStateKnown: task !== null,
-    workflowStepId: task?.workflow_step_id,
-    workflowId: task?.workflow_id,
-  });
+  const searchParams = useSearchParams();
+  const creationPending = isCreationPendingSearch(searchParams);
+  const ensureSession = useEnsureTaskSession(
+    {
+      id: task?.id,
+      isArchived: task?.archived_at != null,
+      archiveStateKnown: task !== null,
+      workflowStepId: task?.workflow_step_id,
+      workflowId: task?.workflow_id,
+    },
+    { enabled: !creationPending },
+  );
   const initialSessionId = sessionId ?? agent.taskSessionId ?? null;
   const effectiveSessionId = validatedActiveSessionId ?? initialSessionId;
 
@@ -454,6 +468,50 @@ function useTaskPageData(
   };
 }
 
+function resolveTaskPageReadFallback({
+  isMounted,
+  task,
+  hasTaskDetails,
+  taskLoadError,
+  isTemporaryTaskReadError,
+  navigationReadState,
+  retryTaskRead,
+}: {
+  isMounted: boolean;
+  task: Task | null;
+  hasTaskDetails: boolean;
+  taskLoadError: unknown;
+  isTemporaryTaskReadError: boolean;
+  navigationReadState: ReturnType<typeof useTaskNavigationReadState>;
+  retryTaskRead: () => void;
+}): ReactNode {
+  if (!isMounted) return <TaskLoadingState />;
+  const hasPermanentTaskReadError = taskLoadError !== null && !isTemporaryTaskReadError;
+  const hasPermanentSharedReadFailure =
+    navigationReadState.phase === "failed" && !navigationReadState.temporary;
+  if (hasPermanentTaskReadError || hasPermanentSharedReadFailure) {
+    return <TaskLoadErrorState />;
+  }
+  const contentState = resolveTaskContentState({
+    isMounted,
+    hasTask: Boolean(task),
+    hasTaskDetails,
+    hasTaskLoadError: Boolean(taskLoadError),
+  });
+  if (contentState === "loading") return <TaskLoadingState />;
+  if (contentState === "error") {
+    return (
+      <TaskLoadErrorState
+        temporaryError={isTemporaryTaskReadError}
+        retrying={isTaskNavigationReadPending(navigationReadState)}
+        onRetry={retryTaskRead}
+      />
+    );
+  }
+  if (!task) return <TaskLoadErrorState />;
+  return null;
+}
+
 function TaskPageContentLive({
   task: initialTask,
   taskId: initialTaskId = null,
@@ -486,7 +544,6 @@ function TaskPageContentLive({
     onTaskUnarchived,
     refreshTask,
   } = useTaskPageData(initialTask, initialTaskId, sessionId, initialRepositories);
-  useTaskWorkflowSnapshot(task);
   const taskCanvasesState = useTaskCanvasesStateForTask(task, canvasesEnabled);
   useExternalVcsFileLinkHydration(task, repositories);
 
@@ -509,24 +566,16 @@ function TaskPageContentLive({
     queueMicrotask(() => setIsMounted(true));
   }, []);
 
-  const contentState = resolveTaskContentState({
+  const readFallback = resolveTaskPageReadFallback({
     isMounted,
-    hasTask: Boolean(task),
+    task,
     hasTaskDetails,
-    hasTaskLoadError: Boolean(taskLoadError),
+    taskLoadError,
+    isTemporaryTaskReadError,
+    navigationReadState,
+    retryTaskRead,
   });
-
-  if (contentState === "loading") return <TaskLoadingState />;
-  if (contentState === "error") {
-    return (
-      <TaskLoadErrorState
-        temporaryError={isTemporaryTaskReadError}
-        retrying={isTaskNavigationReadPending(navigationReadState)}
-        onRetry={retryTaskRead}
-      />
-    );
-  }
-  if (!task) return <TaskLoadErrorState />;
+  if (readFallback) return readFallback;
 
   return (
     <TaskPageInner

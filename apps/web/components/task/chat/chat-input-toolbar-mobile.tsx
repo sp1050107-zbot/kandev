@@ -1,5 +1,7 @@
 "use client";
 
+import type { TaskSessionMCPSelection } from "@/hooks/domains/session/use-task-session-mcp-selection";
+
 import { useState } from "react";
 import { useResponsiveBreakpoint } from "@/hooks/use-responsive-breakpoint";
 import { IconAt } from "@tabler/icons-react";
@@ -30,7 +32,9 @@ type MobileToolbarProps = {
   hideSessionsDropdown: boolean;
   mcpServers: string[];
   mcpAttachmentHistory?: MCPAttachmentHistory;
+  mcpSelection?: TaskSessionMCPSelection | null;
   sessionId: string | null;
+  detailActive: boolean;
   taskId: string | null;
   taskTitle?: string;
   onAttachFiles?: () => void;
@@ -102,6 +106,7 @@ function MobileDefaultLeftActions(props: MobileToolbarProps) {
             <McpIndicator
               mcpServers={props.mcpServers}
               attachmentHistory={props.mcpAttachmentHistory}
+              selection={props.mcpSelection}
             />
           </div>
           <div data-testid="toolbar-item-mode">
@@ -218,7 +223,7 @@ export function MobileChatInputToolbar(props: MobileToolbarProps) {
       />
       {!resetConfirmationOpen ? (
         <div className="flex shrink-0 items-center gap-1">
-          <TokenUsageDisplay sessionId={props.sessionId} />
+          <TokenUsageDisplay sessionId={props.sessionId} detailActive={props.detailActive} />
           {props.planModeEnabled && !props.isAgentBusy && props.onImplementPlan && (
             <ImplementPlanButton
               onClick={props.onImplementPlan}

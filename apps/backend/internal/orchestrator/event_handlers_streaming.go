@@ -18,6 +18,7 @@ import (
 	"github.com/kandev/kandev/internal/orchestrator/messagequeue"
 	"github.com/kandev/kandev/internal/orchestrator/sessionstate"
 	"github.com/kandev/kandev/internal/orchestrator/watcher"
+	"github.com/kandev/kandev/internal/task/dto"
 	"github.com/kandev/kandev/internal/task/models"
 	taskservice "github.com/kandev/kandev/internal/task/service"
 	v1 "github.com/kandev/kandev/pkg/api/v1"
@@ -246,6 +247,8 @@ func (s *Service) handleAgentStreamEvent(ctx context.Context, payload *lifecycle
 
 	case streams.EventTypeSessionInfo:
 		s.handleSessionInfoEvent(ctx, payload)
+	case streams.EventTypePromptSuggestion:
+		s.handlePromptSuggestionEvent(ctx, payload)
 	case streams.EventTypeBackgroundWorkUpdated:
 		s.handleBackgroundWorkUpdatedEvent(ctx, payload)
 
@@ -284,6 +287,7 @@ func (s *Service) handleAgentStreamEvent(ctx context.Context, payload *lifecycle
 
 	case streams.EventTypeTurnStarted:
 		s.persistNativeCodexTurnID(ctx, payload)
+		s.retireCountedEmptyTurn(sessionID)
 		// D3: the single turn boundary for the whole feature. Clearing here,
 		// on the same ordered stream consumer that applies the attestation
 		// (handleToolCallEvent / trackBackgroundToolUpdate above), guarantees
@@ -655,7 +659,9 @@ func (s *Service) handleToolCallEvent(ctx context.Context, payload *lifecycle.Ag
 	}
 
 	if s.messageCreator != nil {
-		if err := s.messageCreator.CreateToolCallMessage(
+		if payload.Data.CanonicalProjection {
+			s.publishCanonicalMessageEvent(ctx, payload)
+		} else if err := s.messageCreator.CreateToolCallMessage(
 			ctx,
 			payload.TaskID,
 			payload.Data.ToolCallID,
@@ -939,7 +945,7 @@ func (s *Service) handleToolUpdateEvent(ctx context.Context, payload *lifecycle.
 	// call; missing parent metadata on an incremental update cannot promote a
 	// child or unknown tool to foreground.
 	if isTerminalToolStatus(payload.Data.ToolStatus) &&
-		len(payload.Data.ToolCallContents) > 0 &&
+		(len(payload.Data.ToolCallContents) > 0 || (payload.Data.CanonicalProjection && payload.Data.ShellOutputHasContent)) &&
 		ownership == toolOwnershipForeground &&
 		s.markForegroundGenerating(payload.SessionID, payload.ExecutionID) {
 		s.publishForegroundActivityChanged(ctx, payload.TaskID, payload.SessionID)
@@ -1001,7 +1007,9 @@ func (s *Service) persistToolUpdateMessage(ctx context.Context, payload *lifecyc
 			// create a message (and implicitly a turn) after the turn settled.
 			fallbackMsgType = ""
 		}
-		if err := s.messageCreator.UpdateToolCallMessage(
+		if payload.Data.CanonicalProjection {
+			s.publishCanonicalMessageEvent(ctx, payload)
+		} else if err := s.messageCreator.UpdateToolCallMessage(
 			ctx,
 			payload.TaskID,
 			payload.Data.ToolCallID,
@@ -1050,7 +1058,10 @@ func (s *Service) trackBackgroundToolUpdate(
 		// active, and synchronous subagents do not carry IsAsync.
 		if normalizedIsDetachedLaunch(payload.Data.Normalized) {
 			kind := backgroundWorkKind(payload.Data.Normalized)
-			if kind == streams.BackgroundWorkKindShell {
+			// Only attest the parked projection for a workload whose provider
+			// can confirm later liveness on this connection. An identified but
+			// unverified launch stays inspectable without claiming to be live.
+			if kind == streams.BackgroundWorkKindShell && payload.Data.Normalized.IsVerifiedBackgroundWork() {
 				// Waiting-attribution spec (docs/specs/disambiguate-waiting):
 				// this is the recognised condition for "a detached
 				// background-shell launch happened during this turn" — the
@@ -1362,6 +1373,9 @@ func (s *Service) updateTaskSessionStateWithHook(
 	// first sample, AC-21) and leaving it (immediate clear, AC-68) regardless
 	// of which of this function's many call sites drove the transition.
 	s.onSessionStateChangedForParkedProjection(ctx, taskID, sessionID, oldState, nextState)
+	if isTerminalSessionState(nextState) {
+		s.settleOpenBackgroundWork(ctx, sessionID)
+	}
 
 	// Auto-promote another session to primary when the current primary enters a terminal state
 	s.maybePromotePrimary(ctx, taskID, sessionID, nextState)
@@ -2043,6 +2057,14 @@ func (s *Service) publishTaskSessionStateChanged(
 	if session.TaskEnvironmentID != "" {
 		eventData["task_environment_id"] = session.TaskEnvironmentID
 	}
+	if reader, ok := s.repo.(dto.SessionRecoveryBlockProjectionReader); ok {
+		projection := dto.TaskSessionDTO{}
+		if err := dto.EnrichSessionRecoveryBlocks(ctx, &projection, session, reader); err == nil {
+			eventData["session_recovery_blocks"] = projection.SessionRecoveryBlocks
+		} else {
+			s.logger.Warn("cannot project session recovery blocks", zap.String("session_id", sessionID), zap.Error(err))
+		}
+	}
 	_ = s.eventBus.Publish(ctx, events.TaskSessionStateChanged, bus.NewEvent(events.TaskSessionStateChanged, "task-session", eventData))
 }
 
@@ -2069,20 +2091,10 @@ func (s *Service) maybePromotePrimary(ctx context.Context, taskID, sessionID str
 		return
 	}
 
-	// Pick the best candidate: prefer RUNNING, then STARTING, then WAITING_FOR_INPUT
-	var candidate string
-	for _, sess := range sessions {
-		if sess.ID == sessionID {
-			continue
-		}
-		if sess.State == models.TaskSessionStateRunning {
-			candidate = sess.ID
-			break
-		}
-		if candidate == "" && isActiveSessionState(sess.State) {
-			candidate = sess.ID
-		}
-	}
+	// Only an active session can inherit the role after a stop. The shared
+	// selector prefers the current step's profile and ranks a parked session
+	// last; a parked session remains eligible when no better active session exists.
+	candidate := s.bestPrimarySessionCandidate(ctx, taskID, sessions, sessionID, true)
 	if candidate != "" {
 		if err := s.SetPrimarySession(ctx, candidate); err != nil {
 			s.logger.Warn("failed to auto-promote primary session",
@@ -3279,6 +3291,18 @@ func (s *Service) handleCompleteStreamEventWithGuardRelease(
 		return
 	}
 
+	completion := emptyTurnCompletionFromPayload(payload)
+	if completion.completeOutput {
+		s.observePromptAttempt(completion.data.SessionID, completion.data.AgentExecutionID,
+			completion.data.PromptGeneration, true, false)
+		s.markDynamicStreakResetPending(completion.data)
+		s.flushPendingDynamicStreakReset(ctx, completion.data.SessionID, &completion.data)
+	}
+	// A launched successor owns the turn, as on the error path.
+	if s.routeDynamicEmptyTurn(ctx, completion, session, streamGuard) {
+		return
+	}
+
 	s.persistCompleteStreamOutput(ctx, payload, session, completionTurnID)
 	s.completeTurnForStreamEvent(ctx, payload, completionTurnID)
 
@@ -3443,6 +3467,12 @@ func (s *Service) reconcileCompleteEventRuntime(
 	if s.handleOfficeTurnComplete(ctx, payload.TaskID, payload.SessionID, session, stopReason) {
 		return true
 	}
+	if payload.Data.TurnID != "" && payload.Data.TurnID == completionTurnID {
+		if !s.observeAutomationRetryTurnTerminal(ctx, payload.TaskID, payload.SessionID, completionTurnID, payload.ExecutionID) {
+			return false
+		}
+	}
+
 	return s.handleAutomationTurnCompleteForTurn(
 		ctx,
 		payload.TaskID,
@@ -3539,6 +3569,46 @@ func sessionStateString(session *models.TaskSession) string {
 		return ""
 	}
 	return string(session.State)
+}
+
+func emptyTurnCompletionFromPayload(payload *lifecycle.AgentStreamEventPayload) emptyTurnCompletion {
+	executionID := payload.ExecutionID
+	if executionID == "" {
+		executionID = payload.AgentID
+	}
+	return emptyTurnCompletion{
+		data: watcher.AgentEventData{
+			TaskID:             payload.TaskID,
+			SessionID:          payload.SessionID,
+			OwnerKind:          string(payload.OwnerKind),
+			AgentExecutionID:   executionID,
+			AgentProfileID:     payload.AgentProfileID,
+			ExecutionProfileID: payload.ExecutionProfileID,
+			PromptGeneration:   payload.Data.PromptGeneration,
+		},
+		stopReason:     extractStopReason(payload),
+		isError:        extractCompleteIsError(payload),
+		completeOutput: completeFrameCarriesOutput(payload),
+	}
+}
+
+// completeFrameCarriesOutput reports whether a completion frame itself carries
+// assistant output: message text (persisted by saveAgentTextForTurn) or plan
+// content (persisted by publishAgentPlanForTurn). Output present only here, and
+// not in earlier stream events, still means the turn produced content.
+func completeFrameCarriesOutput(payload *lifecycle.AgentStreamEventPayload) bool {
+	if payload == nil || payload.Data == nil {
+		return false
+	}
+	if strings.TrimSpace(payload.Data.Text) != "" {
+		return true
+	}
+	if data, ok := payload.Data.Data.(map[string]interface{}); ok {
+		if planContent, ok := data["plan_content"].(string); ok && strings.TrimSpace(planContent) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // Mirrors the same read in lifecycle/manager_events.go.
@@ -4176,25 +4246,39 @@ func (s *Service) handleAgentCapabilitiesEvent(ctx context.Context, payload *lif
 	if sessionID == "" {
 		return
 	}
+	// A capability event from an obsolete execution or resume attempt must not
+	// restore a native suggestion source. The stream dispatcher filters this
+	// too; the check stays here because recording is admission state, not only
+	// a broadcast.
+	if !s.resumeAttemptAllowsExecution(sessionID, payload.ExecutionID, payload.AttemptID) {
+		s.logger.Debug("ignoring agent capabilities from a stale resume attempt",
+			zap.String("session_id", sessionID),
+			zap.String("execution_id", payload.ExecutionID),
+			zap.String("attempt_id", payload.AttemptID))
+		return
+	}
 	// Record the negotiated prompt-queueing advertisement before the event-bus
 	// guard. It gates prompt handoff and mid-turn steering, so it must land as
 	// soon as the agent advertises it — recording is admission state, whereas the
 	// bus below is only broadcast. Skipping it when no bus is configured would
 	// silently make a capable agent ineligible.
 	s.recordSessionPromptQueueing(sessionID, payload.Data.SupportsPromptQueueing)
+	s.recordPromptSuggestionSource(ctx, sessionID, payload.Data.SupportsPromptSuggestions)
 	if s.eventBus == nil {
 		return
 	}
 	eventPayload := lifecycle.AgentCapabilitiesEventPayload{
-		TaskID:                  payload.TaskID,
-		SessionID:               sessionID,
-		AgentID:                 payload.AgentID,
-		SupportsImage:           payload.Data.SupportsImage,
-		SupportsAudio:           payload.Data.SupportsAudio,
-		SupportsEmbeddedContext: payload.Data.SupportsEmbeddedContext,
-		SupportsPromptQueueing:  payload.Data.SupportsPromptQueueing,
-		AuthMethods:             payload.Data.AuthMethods,
-		Timestamp:               time.Now().UTC().Format(time.RFC3339),
+		TaskID:                           payload.TaskID,
+		SessionID:                        sessionID,
+		AgentID:                          payload.AgentID,
+		SupportsImage:                    payload.Data.SupportsImage,
+		SupportsAudio:                    payload.Data.SupportsAudio,
+		SupportsEmbeddedContext:          payload.Data.SupportsEmbeddedContext,
+		SupportsPromptQueueing:           payload.Data.SupportsPromptQueueing,
+		SupportsPromptSuggestions:        payload.Data.SupportsPromptSuggestions,
+		NativePromptSuggestionsSupported: payload.Data.NativePromptSuggestionsSupported,
+		AuthMethods:                      payload.Data.AuthMethods,
+		Timestamp:                        time.Now().UTC().Format(time.RFC3339),
 	}
 	subject := events.BuildAgentCapabilitiesSubject(sessionID)
 	_ = s.eventBus.Publish(ctx, subject, bus.NewEvent(events.AgentCapabilitiesUpdated, "orchestrator", eventPayload))

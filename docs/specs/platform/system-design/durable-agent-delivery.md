@@ -23,8 +23,6 @@ This contract covers authenticated backend-to-agentctl traffic.
 [Browser subscription recovery](../requirements/session-subscription-recovery.md) remains separate.
 [Harness continuity](../../agents/system-design/harness-session-continuity.md) consumes submission outcomes.
 The existing task queue and environment-generation guards retain admission authority.
-The design baseline is main commit `65d64f6fa9f85b4977b8cdd62cf162380732effc`.
-Its durable queue dispatch claims are part of this design, not a parallel recovery mechanism.
 
 The guarantee starts at a successful journal commit.
 A harness can perform a tool action before agentctl observes its event.
@@ -109,22 +107,19 @@ Batch bounds follow the [stream processing design](durable-agent-stream-processi
 Terminal state and its terminal event commit together.
 
 The producer queue has a 4 MiB byte bound.
-An event has a 1 MiB serialized limit.
-Larger text output uses ordered chunks with stable message identity.
-Oversized unsupported payloads stop durable admission with a typed error.
-They cannot disappear silently.
+An event has a 2 MiB serialized limit.
+Text uses ordered chunks. [Bounded tool delivery](bounded-tool-delivery.md)
+defines marked tool-display reduction before acceptance. Accepted data stays
+immutable; unsupported control payloads fail explicitly.
 
 The writer does not hold the ACP receive lock during storage work.
 Cancellation responses and permission responses cannot wait for the event-consumer lock.
 The implementation preserves the existing notification FIFO barrier before prompt completion.
 It replaces the unbounded client queue with bounded intake into the SQL inbox.
 
-The default logical limits are 256 MiB per stream and 2 GiB per journal.
-Each journal reserves 1 MiB for health and terminal metadata.
-Acknowledged event pruning precedes new admission.
-At the limit, agentctl refuses new prompts and requests cancellation of active owned work.
-An out-of-band health error reports a full journal if even the reserved write fails.
-The active submission then remains uncertain.
+Delivery pressure and usable-disk reserves follow AC-PLATFORM-DURABLE-AGENT-DELIVERY-001.4.
+Persistence failure preserves uncertainty and control access rather than cancelling at fixed logical thresholds.
+[Restart reconciliation](durable-restart-reconciliation.md) defines mapping-safe accounting and abandoned dispatch classification.
 
 Files use mode 0600 inside a 0700 directory.
 The exclusive file lock prevents concurrent agentctl writers.
@@ -172,11 +167,13 @@ No time-based expiration can make an old identifier executable again.
 
 ## Submission protocol
 
-The backend allocates and persists the submission ID before the HTTP request.
-Queued submissions retain the existing queue entry and dispatch-attempt identity.
-The record contains the current turn/queue identity and final composed payload hash.
-The hash covers context, prompt text, attachment references, effective configuration, and target identity.
-The payload cannot change under the same ID.
+Bind the initial submission ID before startup; retain source intent in its
+instruction or queue claim. After context preparation and attachment
+materialization, lifecycle's final callback revalidates ownership and persists
+exact dispatch text and descriptors. Initial, direct and queued prompts use
+this boundary: SQL and agentctl hash the same prepared payload, including
+hydration and collision renaming. Preparation failure preserves source intent.
+Existing IDs and hashes remain immutable; preparation never authorizes replay.
 
 The durable states are:
 
@@ -347,7 +344,7 @@ Office and automation consumers use the persistent block from the continuity con
 Provider recovery, budget retries, and scheduler ticks cannot release that block.
 Transport loss does not synthesize task completion or workflow advancement.
 
-The user sees reconnecting, recovered, or uncertain status in the existing recovery surface.
+The [delivery failure design](durable-delivery-failure.md) extends the existing recovery surface.
 Stop remains available during reconciliation.
 Retry reconnect queries state only.
 It does not resend the prompt.

@@ -1,3 +1,4 @@
+import { createPortal } from "react-dom";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { defaultSidebarLayout } from "@/lib/sidebar/layout-types";
@@ -41,6 +42,26 @@ function renderSplit() {
     <SidebarNavigationSplit navigation={<div>Navigation</div>} tasks={<div>Tasks</div>} />,
   );
 }
+
+it("retains child drafts while the rail hides split layout and controls", () => {
+  const navigation = <input aria-label="Navigation draft" defaultValue="initial" />;
+  const tasks = <div>Tasks</div>;
+  const view = render(<SidebarNavigationSplit collapsed navigation={navigation} tasks={tasks} />);
+  const draft = screen.getByRole("textbox", { name: "Navigation draft" }) as HTMLInputElement;
+  fireEvent.change(draft, { target: { value: "unsaved" } });
+  expect(screen.queryByTestId(DIVIDER_TEST_ID)).toBeNull();
+  expect(screen.getByTestId("sidebar-navigation-split").className).toBe("contents");
+  view.rerender(<SidebarNavigationSplit navigation={navigation} tasks={tasks} />);
+  expect(screen.getByRole("textbox", { name: "Navigation draft" })).toBe(draft);
+  expect(draft.value).toBe("unsaved");
+  expect(screen.getByTestId(DIVIDER_TEST_ID)).toBeTruthy();
+  view.rerender(<SidebarNavigationSplit collapsed navigation={navigation} tasks={tasks} />);
+  expect(screen.getByRole("textbox", { name: "Navigation draft" })).toBe(draft);
+  expect(draft.value).toBe("unsaved");
+  expect(screen.queryByTestId(DIVIDER_TEST_ID)).toBeNull();
+  expect(mocks.mutate).not.toHaveBeenCalled();
+});
+
 describe("sidebar split persistence", () => {
   it("expands without discarding the compressed height and restores it", () => {
     const view = renderSplit();
@@ -128,4 +149,27 @@ it("clamps pointer resizing to zero and persists the fully collapsed height", ()
     navigationHeight: 0,
     navigationExpanded: false,
   });
+});
+
+it("expands for clipped navigation focus but ignores portaled menu focus", () => {
+  render(
+    <SidebarNavigationSplit
+      navigation={
+        <>
+          <button>Navigation item</button>
+          {createPortal(<button>Menu item</button>, document.body)}
+        </>
+      }
+      tasks={<div>Tasks</div>}
+    />,
+  );
+  const navigation = screen.getByRole("button", { name: "Navigation item" });
+  const menu = screen.getByRole("button", { name: "Menu item" });
+  vi.spyOn(navigation, "getBoundingClientRect").mockReturnValue({ bottom: 200 } as DOMRect);
+  vi.spyOn(menu, "getBoundingClientRect").mockReturnValue({ bottom: 200 } as DOMRect);
+  fireEvent.focus(navigation);
+  expect(mocks.mutate).toHaveBeenCalledOnce();
+  mocks.mutate.mockClear();
+  fireEvent.focus(menu);
+  expect(mocks.mutate).not.toHaveBeenCalled();
 });

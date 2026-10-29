@@ -1,13 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { IconAlertTriangle, IconRotate, IconX } from "@tabler/icons-react";
 import { Button } from "@kandev/ui/button";
 import { controlSizingClassName } from "@kandev/ui/control-sizing";
 import { CardContent, CardHeader, CardTitle } from "@kandev/ui/card";
 import { Kbd } from "@kandev/ui/kbd";
+import { Input } from "@kandev/ui/input";
 import type { Key, KeyboardShortcut } from "@/lib/keyboard/constants";
-import { formatShortcut, isMac } from "@/lib/keyboard/utils";
+import { formatShortcut } from "@/lib/keyboard/utils";
 import {
   CONFIGURABLE_SHORTCUTS,
   UNBOUND_SHORTCUT,
@@ -71,6 +72,10 @@ export function ShortcutRecorder({
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
       if (!recording) return;
+      if (e.target instanceof HTMLElement && e.target.dataset.shortcutFilter === "true") {
+        setRecording(false);
+        return;
+      }
       if (["Control", "Meta", "Alt", "Shift"].includes(e.key)) return;
       if (shortcutId.startsWith("integration:") && isFocusTraversalKey(e)) {
         setRecording(false);
@@ -245,16 +250,17 @@ function RecorderLabel({
 
 /** Builds a `shortcutId -> conflicting labels` lookup from conflict groups. */
 export function buildConflictLabels(groups: ShortcutConflictGroup[]): Map<string, string[]> {
-  const labels = new Map<string, string[]>();
+  const peersByAction = new Map<string, Map<string, string>>();
   for (const group of groups) {
     for (const entry of group.entries) {
-      labels.set(
-        entry.id,
-        group.entries.filter((other) => other.id !== entry.id).map((other) => other.label),
-      );
+      const peers = peersByAction.get(entry.id) ?? new Map<string, string>();
+      for (const other of group.entries) {
+        if (other.id !== entry.id && !peers.has(other.id)) peers.set(other.id, other.label);
+      }
+      peersByAction.set(entry.id, peers);
     }
   }
-  return labels;
+  return new Map([...peersByAction].map(([id, peers]) => [id, [...new Set(peers.values())]]));
 }
 
 const CONFIGURABLE_SHORTCUT_IDS = Object.keys(CONFIGURABLE_SHORTCUTS) as ConfigurableShortcutId[];
@@ -275,7 +281,7 @@ export function useShortcutConflictLabels(
       entry,
       shortcut: resolveShortcutEntry(entry, overrides),
     }));
-    return buildConflictLabels(findShortcutConflicts(resolved, isMac()));
+    return buildConflictLabels(findShortcutConflicts(resolved));
   }, [pluginEntries, integrationEntries, overrides, translate]);
 }
 
@@ -295,7 +301,14 @@ export function KeyboardShortcutsCard({
 }) {
   const { t } = useTranslation();
   const { isMobile, isFinePointer } = useResponsiveBreakpoint();
+  const [query, setQuery] = useState("");
   const integrations = integrationEntries ?? buildIntegrationShortcutEntries([], [], t);
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const matches = (label: string) => label.toLocaleLowerCase().includes(normalizedQuery);
+  const visibleIds = CONFIGURABLE_SHORTCUT_IDS.filter((id) =>
+    matches(t(CONFIGURABLE_SHORTCUTS[id].labelKey)),
+  );
+  const visibleIntegrations = integrations.filter((entry) => matches(entry.label));
   const shortcuts = resolveAllShortcuts(overrides);
   const baselineShortcuts = resolveAllShortcuts(baselineOverrides);
 
@@ -333,8 +346,12 @@ export function KeyboardShortcutsCard({
         <CardTitle className="text-base">{t("settings:keyboardShortcuts")}</CardTitle>
       </CardHeader>
       <CardContent>
+        <ShortcutFilter query={query} onQueryChange={setQuery} />
+        {normalizedQuery && visibleIds.length === 0 && visibleIntegrations.length === 0 && (
+          <p className="text-sm text-muted-foreground">{t("settings:noMatchingShortcuts")}</p>
+        )}
         <div className="divide-y divide-border">
-          {CONFIGURABLE_SHORTCUT_IDS.map((id) => (
+          {visibleIds.map((id) => (
             <ShortcutRecorder
               key={id}
               shortcutId={id}
@@ -349,20 +366,61 @@ export function KeyboardShortcutsCard({
             />
           ))}
         </div>
-        <IntegrationShortcutRows
-          entries={integrations}
-          overrides={overrides}
-          baselineOverrides={baselineOverrides}
-          conflictLabels={conflictLabels}
-          touchSized={isMobile || !isFinePointer}
-          onChange={handleChange}
-          onReset={handleReset}
-        />
+        {(!normalizedQuery || visibleIntegrations.length > 0) && (
+          <IntegrationShortcutRows
+            entries={visibleIntegrations}
+            overrides={overrides}
+            baselineOverrides={baselineOverrides}
+            conflictLabels={conflictLabels}
+            touchSized={isMobile || !isFinePointer}
+            onChange={handleChange}
+            onReset={handleReset}
+          />
+        )}
         <p className="text-xs text-muted-foreground mt-3">
           {t("settings:clickAShortcutToRecordA")}
         </p>
       </CardContent>
     </SettingsCard>
+  );
+}
+
+function ShortcutFilter({
+  query,
+  onQueryChange,
+}: {
+  query: string;
+  onQueryChange: (value: string) => void;
+}) {
+  const { t } = useTranslation();
+  const inputRef = useRef<HTMLInputElement>(null);
+  return (
+    <div className="mb-3 flex min-w-0 items-center gap-2">
+      <Input
+        ref={inputRef}
+        data-shortcut-filter="true"
+        value={query}
+        onChange={(event) => onQueryChange(event.target.value)}
+        placeholder={t("common:searchEllipsis")}
+        aria-label={t("settings:searchShortcuts")}
+      />
+      {query && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className={controlSizingClassName("icon", "shrink-0 cursor-pointer")}
+          onClick={() => {
+            onQueryChange("");
+            inputRef.current?.focus();
+          }}
+          aria-label={t("tasks:clearSearch")}
+          title={t("tasks:clearSearch")}
+        >
+          <IconX className="size-4" />
+        </Button>
+      )}
+    </div>
   );
 }
 
