@@ -13,8 +13,10 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/kandev/kandev/internal/agentruntime"
 	"github.com/kandev/kandev/internal/db/dialect"
 	"github.com/kandev/kandev/internal/startup"
+	"github.com/kandev/kandev/internal/task/models"
 )
 
 // migrateMessagePayloadStorage adds digest-backed external storage for large
@@ -143,6 +145,9 @@ func (r *Repository) runMigrations(ctx context.Context) error {
 	}
 	r.migrate.Apply("dynamic_route_states.continuation_json", `ALTER TABLE dynamic_route_states ADD COLUMN continuation_json TEXT NOT NULL DEFAULT ''`)
 	r.migrate.Apply("dynamic_route_states.policy_state_json", `ALTER TABLE dynamic_route_states ADD COLUMN policy_state_json TEXT NOT NULL DEFAULT ''`)
+	if err := r.migrate.Apply("dynamic_resource_circuits.failure_count", `ALTER TABLE dynamic_resource_circuits ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
 	if err := r.backfillLegacyActiveDynamicRoutes(); err != nil {
 		return err
 	}
@@ -218,6 +223,11 @@ func (r *Repository) runMigrations(ctx context.Context) error {
 		return err
 	}
 	if err := r.migrateSessionsRemoveAgentExecutionID(); err != nil {
+		return err
+	}
+	// Repair runtime identities on legacy inventory rows so fail-closed
+	// selection admission does not permanently block upgraded sessions.
+	if err := r.backfillExecutorRunningRuntime(); err != nil {
 		return err
 	}
 	// Must run BEFORE migrateTaskEnvironmentsRemoveAgentExecutionID, which copies task_dir_name into the recreated table.
@@ -440,6 +450,12 @@ func (r *Repository) runMigrations(ctx context.Context) error {
 	// compatible with databases whose workflow repository has not replayed its
 	// own migrations yet, same as the columns above.
 	_ = r.migrate.Apply("workflow_steps.order_revision", `ALTER TABLE workflow_steps ADD COLUMN order_revision INTEGER NOT NULL DEFAULT 0`)
+	// Remove the steps that workflow deletes left behind while workflow_steps
+	// had no foreign key (see pruneOrphanWorkflowStepsOnce). Runs after the
+	// projection table exists; the workflows table is created by initSchema.
+	if err := r.pruneOrphanWorkflowStepsOnce(); err != nil {
+		return err
+	}
 
 	// Slack-style unread divider: the read cursor a session advances to the
 	// latest message id whenever it becomes the visible chat panel. The
@@ -685,6 +701,21 @@ func (r *Repository) runMigrations(ctx context.Context) error {
 
 	_ = r.migrate.Apply("tasks.executor_actor_user_id", "ALTER TABLE tasks ADD COLUMN executor_actor_user_id TEXT NOT NULL DEFAULT ''")
 	_ = r.migrate.Apply("workflows.created_by_user_id", "ALTER TABLE workflows ADD COLUMN created_by_user_id TEXT NOT NULL DEFAULT ''")
+
+	if err := r.migrateTurnChangeHistorySchema(); err != nil {
+		return err
+	}
+
+	// Delivery refresh resolves snapshots through their environment owner or a
+	// task/session binding. Both keys are needed by that correlated lookup, and
+	// the environment must lead because each outer snapshot supplies it. Create
+	// the index after both legacy session-table rebuilds above so neither
+	// rebuild can drop it.
+	if err := r.migrate.ApplyContext(ctx, "task_sessions.environment_task_index", `
+		CREATE INDEX IF NOT EXISTS idx_task_sessions_environment_task
+		ON task_sessions(task_environment_id, task_id)`); err != nil {
+		return fmt.Errorf("create task session environment index: %w", err)
+	}
 
 	// Checked last so a failure on any required migration above --
 	// including this file's own marker_positions column -- fails startup
@@ -1263,6 +1294,65 @@ func (r *Repository) backfillExecutorsRunningFromTaskSessions() error {
 		WHERE COALESCE(ts.agent_execution_id, '') != '' AND er.id IS NULL
 	`, now); err != nil {
 		return fmt.Errorf("backfill executors_running: %w", err)
+	}
+	return nil
+}
+
+// backfillExecutorRunningRuntime repairs inventory rows created before runtime
+// identity was recorded. Only persisted executor evidence is used: an executor
+// row, the session's executor snapshot, or the task environment. Rows whose
+// identity cannot be established stay empty and remain fail-closed.
+func (r *Repository) backfillExecutorRunningRuntime() error {
+	type legacyRuntimeRow struct {
+		ID           string `db:"id"`
+		ExecutorType string `db:"executor_type"`
+	}
+	rows, err := r.db.QueryxContext(r.migrationContext(), `
+		SELECT
+			er.id AS id,
+			COALESCE(e.type, '') AS executor_type
+		FROM executors_running er
+		LEFT JOIN executors e ON e.id = er.executor_id
+		WHERE COALESCE(er.runtime, '') = ''
+	`)
+	if err != nil {
+		return fmt.Errorf("backfill executor runtime: query legacy rows: %w", err)
+	}
+	var legacyRows []legacyRuntimeRow
+	for rows.Next() {
+		var legacy legacyRuntimeRow
+		if err := rows.StructScan(&legacy); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("backfill executor runtime: scan legacy row: %w", err)
+		}
+		legacyRows = append(legacyRows, legacy)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("backfill executor runtime: iterate legacy rows: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("backfill executor runtime: close legacy rows: %w", err)
+	}
+
+	for _, legacy := range legacyRows {
+		executorType := strings.TrimSpace(legacy.ExecutorType)
+		if executorType == "" {
+			continue
+		}
+		// Only types that cannot have fallen back to standalone are safe to
+		// backfill from the selected executor. Docker/SSH/Kubernetes rows may
+		// describe a legacy fallback execution and must stay fail-closed.
+		if models.ExecutorType(executorType).Runtime() != agentruntime.RuntimeStandalone {
+			continue
+		}
+		runtimeName := agentruntime.RuntimeStandalone
+		if _, err := r.db.ExecContext(r.migrationContext(),
+			r.db.Rebind(`UPDATE executors_running SET runtime = ? WHERE id = ? AND COALESCE(runtime, '') = ''`),
+			string(runtimeName), legacy.ID,
+		); err != nil {
+			return fmt.Errorf("backfill executor runtime: update row %q: %w", legacy.ID, err)
+		}
 	}
 	return nil
 }

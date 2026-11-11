@@ -275,6 +275,12 @@ func (s *Service) CreateTask(ctx context.Context, req *CreateTaskRequest) (Creat
 	if err := refuseReservedMetadata(req.Metadata, req.AllowReservedMetadata); err != nil {
 		return CreateTaskResult{}, err
 	}
+	if err := s.authorizeTaskExecutorSelection(ctx, &models.Task{}, req.Metadata); err != nil {
+		return CreateTaskResult{}, err
+	}
+	if err := s.validateBuiltinTaskCreation(ctx, req); err != nil {
+		return CreateTaskResult{}, err
+	}
 	if err := s.validateRequestedExecutorAdmission(ctx, req); err != nil {
 		return CreateTaskResult{}, err
 	}
@@ -326,6 +332,9 @@ type preparedTask struct {
 // required validation, workflow/step resolution, and office identifier
 // assignment, producing the in-memory task CreateTask is about to insert.
 func (s *Service) prepareTaskForCreation(ctx context.Context, req *CreateTaskRequest, externalID string) (*preparedTask, error) {
+	if req.RequiredSubtaskCount < 0 {
+		return nil, fmt.Errorf("required subtask count must not be negative")
+	}
 	// Subtasks created without an explicit project inherit the parent's, so
 	// office cost events (which copy tasks.project_id verbatim) attribute to
 	// the same project as the rest of the tree instead of leaking. Runs first
@@ -461,6 +470,9 @@ func (s *Service) resolveTaskCreationReferences(
 	if err := s.validateBlockerReferences(ctx, req); err != nil {
 		return nil, err
 	}
+	if err := s.validateRelationReferences(ctx, req); err != nil {
+		return nil, err
+	}
 	repositories, err := s.resolveTaskRepositoryRowsWithResolvedIdentityDedup(
 		ctx, req.WorkspaceID, req.Repositories, req.projectRepositoryDefaults,
 	)
@@ -517,6 +529,9 @@ func (s *Service) loadContributionDestinationRepositories(
 // task repositories, the created-event publish, and the feeder-pull refresh.
 func (s *Service) finalizeCreatedTask(ctx context.Context, prepared *preparedTask, req *CreateTaskRequest) (CreateTaskResult, error) {
 	task := prepared.task
+	if err := s.applyBuiltinTaskCreation(ctx, task.ID, req); err != nil {
+		return CreateTaskResult{}, s.rollbackPartialTask(ctx, task.ID, err)
+	}
 	// Create blocker relationships if specified. Every id here was validated
 	// pre-insert, so a failure now means the blocker was deleted underneath
 	// us — rare, but it must not leave the half-built task behind.
@@ -524,6 +539,15 @@ func (s *Service) finalizeCreatedTask(ctx context.Context, prepared *preparedTas
 		if err := s.AddBlocker(ctx, task.ID, blockerID); err != nil {
 			return CreateTaskResult{}, s.rollbackPartialTask(ctx, task.ID, fmt.Errorf("add blocker %s: %w", blockerID, err))
 		}
+	}
+	for _, relatedID := range req.RelatedTaskIDs {
+		if err := s.relations.AddRelation(ctx, task.ID, relatedID); err != nil {
+			return CreateTaskResult{}, s.rollbackPartialTask(ctx, task.ID, fmt.Errorf("add related task %s: %w", relatedID, err))
+		}
+		// The peer already exists and may be open in another client; its own
+		// task.created already fired, so it only learns about this edge via an
+		// explicit refresh. publishDependencyChange covers both ends.
+		s.publishDependencyChange(ctx, task.ID, relatedID)
 	}
 
 	if err := s.persistTaskRepositoryRows(ctx, task.ID, prepared.repositories); err != nil {
@@ -851,9 +875,10 @@ func (s *Service) inheritParentRepositories(ctx context.Context, req *CreateTask
 			return err
 		}
 		inherited = append(inherited, TaskRepositoryInput{
-			CheckoutOptions: options,
-			RepositoryID:    r.RepositoryID,
-			BaseBranch:      r.BaseBranch,
+			CheckoutOptions:           options,
+			RepositoryID:              r.RepositoryID,
+			BaseBranch:                r.BaseBranch,
+			BaseBranchSelectionSource: models.BaseBranchSelectionSourceInherited,
 		})
 	}
 	if len(inherited) > 0 {
@@ -1039,6 +1064,12 @@ func (s *Service) buildTask(ctx context.Context, req *CreateTaskRequest, workflo
 		priority = defaultPriority
 	}
 	metadata := protectedTaskMetadataForCreate(req.Metadata, req.TrustedHandoffMetadata)
+	if req.RequiredSubtaskCount > 0 {
+		if metadata == nil {
+			metadata = make(map[string]interface{})
+		}
+		metadata[models.MetaKeyRequiredSubtaskCount] = req.RequiredSubtaskCount
+	}
 	models.StripOfficeCarrierMetadata(metadata)
 	if len(req.OfficeCarrierMetadata) > 0 {
 		if metadata == nil {
@@ -1248,6 +1279,10 @@ func buildResolvedTaskRepositoryRow(repositoryID, baseBranch string, index int, 
 	if err != nil {
 		return nil, err
 	}
+	selection := buildBaseBranchSelection(repoInput, baseBranch, policy)
+	if err := models.PutBaseBranchSelection(metadata, &selection); err != nil {
+		return nil, err
+	}
 	row := &models.TaskRepository{
 		RepositoryID:   repositoryID,
 		BaseBranch:     baseBranch,
@@ -1263,6 +1298,36 @@ func buildResolvedTaskRepositoryRow(repositoryID, baseBranch string, index int, 
 		row.BranchPolicyPullRequestTarget = policy.PullRequestTarget
 	}
 	return row, nil
+}
+
+// buildBaseBranchSelection records the effective branch and its trusted
+// source after branch-policy resolution. Policy-backed, contribution, and
+// PR-linked attachments are always explicit; an omitted base that resolves
+// from the repository default stays automatic.
+func buildBaseBranchSelection(
+	repoInput TaskRepositoryInput, finalBaseBranch string, policy *models.RepositoryBranchPolicy,
+) models.BaseBranchSelection {
+	source := repoInput.BaseBranchSelectionSource
+	switch source {
+	case models.BaseBranchSelectionSourceExplicit,
+		models.BaseBranchSelectionSourceInherited,
+		models.BaseBranchSelectionSourceRepositoryDefault:
+	default:
+		source = models.BaseBranchSelectionSourceExplicit
+		if repoInput.BaseBranchSelectionSource == "" && policy == nil &&
+			strings.TrimSpace(repoInput.BaseBranch) == "" &&
+			repoInput.RemoteContribution == nil && resolvePRNumber(repoInput) == 0 {
+			source = models.BaseBranchSelectionSourceRepositoryDefault
+		}
+	}
+	if policy != nil || repoInput.RemoteContribution != nil || resolvePRNumber(repoInput) > 0 {
+		source = models.BaseBranchSelectionSourceExplicit
+	}
+	return models.BaseBranchSelection{
+		Version: models.BaseBranchSelectionVersion,
+		Branch:  finalBaseBranch,
+		Source:  source,
+	}
 }
 
 // normalizeContributionBindings validates the remote-contribution and
@@ -1319,7 +1384,7 @@ func buildTaskRepositoryMetadata(repoInput TaskRepositoryInput) (map[string]inte
 		return nil, err
 	}
 	if prNum := resolvePRNumber(repoInput); prNum > 0 {
-		metadata["pr_number"] = prNum
+		metadata[models.TaskRepositoryPRNumberMetadataKey] = prNum
 	}
 	if repoInput.RemoteContribution != nil {
 		if err := models.PutRemoteContribution(metadata, repoInput.RemoteContribution); err != nil {
@@ -2150,7 +2215,10 @@ func (s *Service) UpdateTask(ctx context.Context, id string, req *UpdateTaskRequ
 		return nil, err
 	}
 	if err := s.authorizeTaskExecutorMutation(ctx, task); err != nil {
-		return nil, err
+		return nil, executorMutationDenial(err)
+	}
+	if err := s.authorizeTaskExecutorSelection(ctx, task, req.Metadata); err != nil {
+		return nil, executorMutationDenial(err)
 	}
 	assignee, err := s.validateTaskUpdateReferences(ctx, task, req)
 	if err != nil {

@@ -207,6 +207,7 @@ export type UserSettings = {
   preferred_shell?: string;
   default_editor_id?: string;
   enable_preview_on_click?: boolean;
+  escape_cancels_agent?: boolean;
   chat_submit_key?: "enter" | "cmd_enter";
   show_anchored_prompt_bar?: boolean;
   show_scroll_to_last_prompt?: boolean;
@@ -219,6 +220,8 @@ export type UserSettings = {
   confirm_task_archive?: boolean;
   prevent_auto_start_agent_on_open?: boolean;
   unread_divider?: boolean;
+  unread_task_dot?: boolean;
+  unread_task_dot_hide_delay_seconds?: number;
   agent_generated_task_titles?: boolean;
   prompt_suggestions?: boolean;
   auto_focus_new_tasks?: boolean;
@@ -294,6 +297,7 @@ export type UserSettingsUpdatePayload = {
   preferred_shell?: string;
   default_editor_id?: string;
   enable_preview_on_click?: boolean;
+  escape_cancels_agent?: boolean;
   chat_submit_key?: "enter" | "cmd_enter";
   show_anchored_prompt_bar?: boolean;
   show_scroll_to_last_prompt?: boolean;
@@ -306,6 +310,8 @@ export type UserSettingsUpdatePayload = {
   confirm_task_archive?: boolean;
   prevent_auto_start_agent_on_open?: boolean;
   unread_divider?: boolean;
+  unread_task_dot?: boolean;
+  unread_task_dot_hide_delay_seconds?: number;
   agent_generated_task_titles?: boolean;
   prompt_suggestions?: boolean;
   auto_focus_new_tasks?: boolean;

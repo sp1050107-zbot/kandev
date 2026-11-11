@@ -30,11 +30,14 @@ type UserSettingsDTO struct {
 	PreferredShell                    string                                  `json:"preferred_shell"`
 	DefaultEditorID                   string                                  `json:"default_editor_id"`
 	EnablePreviewOnClick              bool                                    `json:"enable_preview_on_click"`
+	EscapeCancelsAgent                bool                                    `json:"escape_cancels_agent"`
 	ChatSubmitKey                     string                                  `json:"chat_submit_key"`
 	ReviewAutoMarkOnScroll            bool                                    `json:"review_auto_mark_on_scroll"`
 	ConfirmTaskArchive                bool                                    `json:"confirm_task_archive"`
 	PreventAutoStartAgentOnOpen       bool                                    `json:"prevent_auto_start_agent_on_open"`
 	UnreadDivider                     bool                                    `json:"unread_divider"`
+	UnreadTaskDot                     bool                                    `json:"unread_task_dot"`
+	UnreadTaskDotHideDelaySeconds     int                                     `json:"unread_task_dot_hide_delay_seconds"`
 	AgentGeneratedTaskTitles          bool                                    `json:"agent_generated_task_titles"`
 	PromptSuggestions                 bool                                    `json:"prompt_suggestions"`
 	AutoFocusNewTasks                 bool                                    `json:"auto_focus_new_tasks"`
@@ -153,11 +156,14 @@ type UpdateUserSettingsRequest struct {
 	PreferredShell                    *string                            `json:"preferred_shell,omitempty"`
 	DefaultEditorID                   *string                            `json:"default_editor_id,omitempty"`
 	EnablePreviewOnClick              *bool                              `json:"enable_preview_on_click,omitempty"`
+	EscapeCancelsAgent                *bool                              `json:"escape_cancels_agent,omitempty"`
 	ChatSubmitKey                     *string                            `json:"chat_submit_key,omitempty"`
 	ReviewAutoMarkOnScroll            *bool                              `json:"review_auto_mark_on_scroll,omitempty"`
 	ConfirmTaskArchive                *bool                              `json:"confirm_task_archive,omitempty"`
 	PreventAutoStartAgentOnOpen       *bool                              `json:"prevent_auto_start_agent_on_open,omitempty"`
 	UnreadDivider                     *bool                              `json:"unread_divider,omitempty"`
+	UnreadTaskDot                     *bool                              `json:"unread_task_dot,omitempty"`
+	UnreadTaskDotHideDelaySeconds     *int                               `json:"unread_task_dot_hide_delay_seconds,omitempty"`
 	AgentGeneratedTaskTitles          *bool                              `json:"agent_generated_task_titles,omitempty"`
 	PromptSuggestions                 *bool                              `json:"prompt_suggestions,omitempty"`
 	AutoFocusNewTasks                 *bool                              `json:"auto_focus_new_tasks,omitempty"`
@@ -359,11 +365,14 @@ func FromUserSettings(settings *models.UserSettings) UserSettingsDTO {
 		PreferredShell:                    settings.PreferredShell,
 		DefaultEditorID:                   settings.DefaultEditorID,
 		EnablePreviewOnClick:              settings.EnablePreviewOnClick,
+		EscapeCancelsAgent:                settings.EscapeCancelsAgent,
 		ChatSubmitKey:                     settings.ChatSubmitKey,
 		ReviewAutoMarkOnScroll:            settings.ReviewAutoMarkOnScroll,
 		ConfirmTaskArchive:                settings.ConfirmTaskArchive,
 		PreventAutoStartAgentOnOpen:       settings.PreventAutoStartAgentOnOpen,
 		UnreadDivider:                     settings.UnreadDivider,
+		UnreadTaskDot:                     settings.UnreadTaskDot,
+		UnreadTaskDotHideDelaySeconds:     settings.UnreadTaskDotHideDelaySeconds,
 		AgentGeneratedTaskTitles:          settings.AgentGeneratedTaskTitles,
 		PromptSuggestions:                 settings.PromptSuggestions,
 		AutoFocusNewTasks:                 settings.AutoFocusNewTasks,
