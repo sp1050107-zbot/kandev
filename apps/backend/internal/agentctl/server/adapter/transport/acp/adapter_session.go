@@ -192,6 +192,7 @@ func (a *Adapter) newSession(ctx context.Context, mcpServers []types.McpServer) 
 	priorSessionID := a.sessionID
 	a.pendingCopilotNative = nil
 	a.pendingCopilotNativeDropped = false
+	a.clearCopilotInterruptionLocked()
 	a.mu.Unlock()
 
 	if conn == nil {
@@ -734,6 +735,10 @@ func (a *Adapter) LoadSession(ctx context.Context, sessionID string, mcpServers 
 	a.isLoadingSession = true
 	a.loadingSessionID = sessionID
 	a.loadReplayPlan = nil
+	a.copilotInterruption = copilotInterruptionState{
+		sessionID:        sessionID,
+		coreMCPDelivered: copilotCoreMCPDelivered(mcpServers, a.projectDeliveryEvidence()),
+	}
 	delete(a.usageBySession, sessionID)
 	a.mu.Unlock()
 
@@ -763,6 +768,7 @@ func (a *Adapter) LoadSession(ctx context.Context, sessionID string, mcpServers 
 			a.loadReplayPlan = nil
 			a.pendingCopilotNative = nil
 			a.pendingCopilotNativeDropped = false
+			a.clearCopilotInterruptionLocked()
 			a.mu.Unlock()
 		}
 		if !a.syncNotifQueueThen(clearFailedLoad) {
@@ -873,6 +879,7 @@ func (a *Adapter) ResumeSession(ctx context.Context, sessionID string, mcpServer
 	a.mu.Lock()
 	conn := a.acpConn
 	supportsResume := a.capabilities.SessionCapabilities.Resume != nil
+	a.clearCopilotInterruptionLocked()
 	a.mu.Unlock()
 	if conn == nil {
 		return fmt.Errorf("adapter not initialized")
@@ -1204,6 +1211,7 @@ func (a *Adapter) emitSessionModels(sessionID string, models *sessionModelState,
 		ConfigOptions:             configOptions,
 		SessionSettingsPolicy:     providerRestoredPolicy(settingsPolicies...),
 		SessionSettingsGeneration: a.nextSessionSettingsGeneration(sessionID),
+		Data:                      map[string]any{streams.ConfigOptionsSourceKey: streams.ConfigOptionsSourceSessionSetup},
 	})
 }
 
@@ -1214,6 +1222,7 @@ func (a *Adapter) emitSessionConfigOptionsState(sessionID string, configOptions 
 		ConfigOptions:             cloneConfigOptions(configOptions),
 		SessionSettingsPolicy:     providerRestoredPolicy(settingsPolicies...),
 		SessionSettingsGeneration: a.nextSessionSettingsGeneration(sessionID),
+		Data:                      map[string]any{streams.ConfigOptionsSourceKey: streams.ConfigOptionsSourceSessionSetup},
 	})
 }
 
@@ -2170,7 +2179,10 @@ func (a *Adapter) Authenticate(ctx context.Context, methodID string) error {
 	if a.cfg != nil {
 		policy = a.cfg.AuthPolicy
 	}
-	if policy != nil && acpcompat.IsAntigravity(a.agentID) && methodID != policy.MethodID {
+	if policy != nil && acpcompat.IsAntigravity(a.agentID) && policy.RuntimeVariant == acpcompat.AntigravityRuntimeCLI {
+		return acpcompat.ErrTaskAuthenticationDenied
+	}
+	if policy != nil && acpcompat.IsAntigravity(a.agentID) && policy.RuntimeVariant != acpcompat.AntigravityRuntimeCLI && methodID != policy.MethodID {
 		return fmt.Errorf("antigravity authentication method %q is not supported", methodID)
 	}
 	a.mu.RLock()
@@ -2180,7 +2192,7 @@ func (a *Adapter) Authenticate(ctx context.Context, methodID string) error {
 	if conn == nil {
 		return fmt.Errorf("adapter not initialized")
 	}
-	if policy != nil && acpcompat.IsAntigravity(a.agentID) {
+	if policy != nil && acpcompat.IsAntigravity(a.agentID) && policy.RuntimeVariant != acpcompat.AntigravityRuntimeCLI {
 		return a.authenticateAntigravity(ctx, policy)
 	}
 
