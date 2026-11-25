@@ -432,17 +432,16 @@ External MCP calls have no verified creating session. With **Creating session pr
 
 ### Choose task-specific workflow profiles
 
-When a workflow has fixed agent profiles on its steps, expand **Advanced
-settings** while creating a task to replace one or more of them for that task.
-Kandev groups steps that use the same fixed profile into one row and lists the
-affected steps. Select an enabled profile from the replacement picker, or
-choose **Use workflow profile** to keep the workflow choice.
+When you create a task, open **Advanced settings** to find **Workflow agents**.
+Each row lists the steps that share a fixed profile. The picker shows the
+workflow's default profile until you choose a replacement.
 
-These replacements belong to the task only. They do not change the workflow,
-the profile definitions, or another task in the same workflow. Kandev also
-keeps the choices out of recently used task settings. Use **Reset** to remove
-all replacements. Closing and reopening **Advanced settings** keeps the current
-choices, while changing the workflow or starting a new task clears them.
+Select an enabled profile to use for those steps. To restore the profile for
+one row, select **Use default** beside its picker. If several rows have
+replacements, select **Reset** to restore all defaults.
+
+Replacements apply only to this task. Kandev keeps them out of recently used task settings.
+Closing **Advanced settings** keeps your choices. Changing the workflow or opening a new task clears them.
 
 Explicit **Initial agent session** and earlier-step session targets keep their
 existing conversation selection. A replacement applies when a fixed step
@@ -693,6 +692,12 @@ The chip counts only running jobs. Select it to open a running-only summary.
 Selecting a job opens its own tab in the central area on desktop, or a
 full-height detail view on a phone. **View all work** opens the Background Work
 overview. Closing a tab or view does not stop the job.
+
+Cursor shell watches also appear as Monitor entries. An explicit ACP failure
+appears as Failed. A cancelled prompt interrupts only its watches that are still
+running, and a replaced native session leaves unresolved watches as Unknown.
+These states describe the watch, not the shell process. Cursor does not provide
+shell output, controls, or an exit status in this view.
 
 The overview has two tabs. **Active** lists running and waiting jobs. **History**
 lists completed, failed, interrupted, ended, and unknown jobs. Each tab shows its
